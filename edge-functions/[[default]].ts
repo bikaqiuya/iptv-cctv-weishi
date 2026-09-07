@@ -14,7 +14,7 @@ const ORDERED_GROUPS = ["央视", "卫视", "高清", "少儿", "音乐", "动�
 
 // ========== 工具函数 ==========
 
-// ★ 央视名称标准化（修复：提取数字即可，忽略后缀）
+// ★ 央视名称标准化
 function normalizeCCTV(name: string): string | null {
   const n = name.trim().toLowerCase().replace(/\s+/g, "");
   const m = n.match(/^cctv-?(\d{1,2})/);
@@ -80,7 +80,7 @@ function matchInternetCategory(name: string): string | null {
 function getLogo(chanName: string): string {
   const cctvMatch = chanName.match(/^CCTV-(\d+)/);
   if (cctvMatch) return `https://live.fanmingming.cn/tv/CCTV-${cctvMatch[1]}.png`;
-  const satMatch = chanMatch = chanName.match(/^([\u4e00-\u9fa5]{2,4})卫视/);
+  const satMatch = chanName.match(/^([\u4e00-\u9fa5]{2,4})卫视/);
   if (satMatch) return `https://live.fanmingming.cn/tv/${satMatch[1]}卫视.png`;
   return `https://live.fanmingming.cn/tv/${chanName}.png`;
 }
