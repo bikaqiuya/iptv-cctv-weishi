@@ -1,0 +1,8 @@
+{
+  "build": {
+    "command": "npm install",
+    "output": ".",
+    "nodeVersion": "20.18.0"
+  },
+  "runtime": "edge"
+}
