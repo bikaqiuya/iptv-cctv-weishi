@@ -1,5 +1,13 @@
+// ========== 配置 ==========
+const CACHE_VERSION = "v3";
+const CACHE_KEY = `iptv_data_${CACHE_VERSION}`;
+const CACHE_TTL = 12 * 60 * 60 * 1000;       // 12小时
+const FETCH_TIMEOUT = 8000;                    // 单源8秒超时
+const RATE_LIMIT = 20;                         // IP限流阈值
+
 // ========== 工具函数 ==========
 
+// 央视归一化
 function normalizeCCTV(name: string): string | null {
   const n = name.trim();
   const m = n.match(/^CCTV[-_ ]?(\d+)(\s*([\u4e00-\u9fa5]+))?/i);
@@ -15,12 +23,14 @@ function normalizeCCTV(name: string): string | null {
   return `CCTV-${num}${suffix ? " " + suffix : ""}`;
 }
 
+// 卫视归一化
 function normalizeSatellite(name: string): string | null {
   const n = name.trim();
   const m = n.match(/^([\u4e00-\u9fa5]{2,4})\s*卫视/i);
   return m ? `${m[1]}卫视` : null;
 }
 
+// 附加分类匹配
 function matchExtraCategories(name: string): string[] {
   const n = name.toLowerCase();
   const categories: string[] = [];
@@ -35,13 +45,12 @@ function matchExtraCategories(name: string): string[] {
   return categories;
 }
 
-// ★ 更新：互联网影视分类（含动漫）
+// 互联网影视分类
 function matchInternetCategory(name: string): string | null {
   const n = name.toLowerCase();
 
   if (/频道|电视台|tv$|radio/i.test(n)) return null;
 
-  // 有集数
   if (/第.{1,4}集|集$|连载|更新至|ep\d+|s\d+e\d+|season|剧集/.test(n)) {
     if (/动漫|动画|卡通|anime|comic|番|二次元|漫画/.test(n)) {
       return "互联网动漫";
@@ -49,17 +58,14 @@ function matchInternetCategory(name: string): string | null {
     return "互联网电视剧";
   }
 
-  // 动漫作品
   if (/动漫|动画|卡通|anime|comic|番|二次元|漫画/.test(n)) {
     return "互联网动漫";
   }
 
-  // 电影
   if (/电影|影院|剧场版|film|movie|cinema/.test(n)) {
     return "互联网电影";
   }
 
-  // 兜底
   if (/^[\u4e00-\u9fa5]{2,15}$/.test(name)) {
     return "互联网电影";
   }
@@ -67,12 +73,49 @@ function matchInternetCategory(name: string): string | null {
   return null;
 }
 
+// 主分组判定
 function getMainGroup(name: string): { keep: boolean; std: string; group: string } {
   const cctv = normalizeCCTV(name);
   if (cctv) return { keep: true, std: cctv, group: "央视" };
   const sat = normalizeSatellite(name);
   if (sat) return { keep: true, std: sat, group: "卫视" };
   return { keep: false, std: "", group: "" };
+}
+
+// 获取频道logo
+function getLogo(chanName: string): string {
+  const cctvMatch = chanName.match(/^CCTV-(\d+)/);
+  if (cctvMatch) {
+    return `https://live.fanmingming.cn/tv/CCTV-${cctvMatch[1]}.png`;
+  }
+  const satMatch = chanName.match(/^([\u4e00-\u9fa5]{2,4})卫视/);
+  if (satMatch) {
+    return `https://live.fanmingming.cn/tv/${satMatch[1]}卫视.png`;
+  }
+  return "";
+}
+
+// M3U过滤器
+function filterM3U(m3u: string, filter: string): string {
+  const lines = m3u.split("\n");
+  const filtered: string[] = [];
+  let keep = false;
+  for (const line of lines) {
+    if (line.startsWith("#EXTM3U")) {
+      filtered.push(line);
+      continue;
+    }
+    if (line.startsWith("#EXTINF")) {
+      keep = line.includes(`group-title="${filter}"`);
+      if (keep) filtered.push(line);
+      continue;
+    }
+    if (keep && line.trim()) {
+      filtered.push(line);
+      keep = false;
+    }
+  }
+  return filtered.join("\n");
 }
 
 // ========== 拉取源 + 聚合 ==========
@@ -89,9 +132,17 @@ async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string>
   const results = await Promise.all(
     sources.map(async (url) => {
       try {
-        const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+        const r = await fetch(url, {
+          signal: controller.signal,
+          headers: { "User-Agent": "Mozilla/5.0" }
+        });
+        clearTimeout(timeoutId);
         return r.ok ? await r.text() : "";
-      } catch { return ""; }
+      } catch {
+        return "";
+      }
     })
   );
 
@@ -142,19 +193,34 @@ async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string>
     }
   }
 
+  // 生成 M3U
   let m3u = "#EXTM3U";
   if (epgUrl) m3u += ` url-tvg="${epgUrl}"`;
   m3u += "\n";
 
   const orderedGroups = ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "互联网动漫", "互联网电影", "互联网电视剧"];
 
+  // 央视数字排序
+  const cctvOrder = (a: string, b: string) => {
+    const na = a.match(/CCTV-(\d+)/)?.[1] || "999";
+    const nb = b.match(/CCTV-(\d+)/)?.[1] || "999";
+    return parseInt(na) - parseInt(nb);
+  };
+
   for (const g of orderedGroups) {
     const chanMap = groups[g];
     if (!chanMap) continue;
-    const chanNames = Object.keys(chanMap).sort((a, b) => a.localeCompare(b));
+    let chanNames = Object.keys(chanMap);
+    if (g === "央视") {
+      chanNames.sort(cctvOrder);
+    } else {
+      chanNames.sort((a, b) => a.localeCompare(b));
+    }
     for (const chan of chanNames) {
       for (const url of chanMap[chan]) {
-        m3u += `#EXTINF:-1 tvg-name="${chan}" group-title="${g}",${chan}\n${url}\n`;
+        const logo = getLogo(chan);
+        const logoAttr = logo ? ` tvg-logo="${logo}"` : "";
+        m3u += `#EXTINF:-1 tvg-name="${chan}"${logoAttr} group-title="${g}",${chan}\n${url}\n`;
       }
     }
   }
@@ -203,6 +269,18 @@ export async function onRequest(context: any) {
   const { request, env } = context;
   const url = new URL(request.url);
   const path = url.pathname;
+  const kv = env.IPTV_KV;
+
+  // ===== IP限流 =====
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const rateKey = `rate_${ip}`;
+  try {
+    const attempts = await kv.get(rateKey);
+    if (attempts && parseInt(attempts) > RATE_LIMIT) {
+      return new Response("Rate limited", { status: 429 });
+    }
+    await kv.put(rateKey, String((parseInt(attempts || "0") + 1)), { expirationTtl: 60 });
+  } catch {}
 
   if (path === "/" || path === "/index.html") {
     return new Response(HTML_HOME, { headers: { "Content-Type": "text/html; charset=utf-8" } });
@@ -215,24 +293,44 @@ export async function onRequest(context: any) {
 
     const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
     const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
-    const epgUrl = epgList.join(",");
+    const epgUrl = epgList[0] || ""; // 只取第一个EPG源
     if (sources.length === 0) return new Response("SOURCES not configured", { status: 500 });
 
-    const kv = env.IPTV_KV;
-    const CACHE_KEY = "iptv_data";
-    const CACHE_TTL = 12 * 60 * 60 * 1000;
+    const filter = url.searchParams.get("filter");
 
+    // ===== 缓存读取 =====
     let cached: { m3u: string; updated_at: number } | null = null;
     try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw as any; } catch {}
 
     const now = Date.now();
+
+    // 缓存有效
     if (cached && (now - cached.updated_at) < CACHE_TTL) {
-      return new Response(cached.m3u, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
+      let output = cached.m3u;
+      if (filter) output = filterM3U(output, filter);
+      return new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
     }
 
+    // 缓存过期 → Stale-While-Revalidate：先返回旧数据，后台刷新
+    if (cached && (now - cached.updated_at) >= CACHE_TTL) {
+      let output = cached.m3u;
+      if (filter) output = filterM3U(output, filter);
+      const response = new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
+
+      // 后台异步刷新（不阻塞返回）
+      fetchAndBuild(sources, epgUrl).then(m3u => {
+        kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: Date.now() })).catch(() => {});
+      }).catch(() => {});
+
+      return response;
+    }
+
+    // 无缓存 → 同步构建
     const m3u = await fetchAndBuild(sources, epgUrl);
     try { await kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: now })); } catch {}
-    return new Response(m3u, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
+    let output = m3u;
+    if (filter) output = filterM3U(output, filter);
+    return new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
   }
 
   if (path === "/refresh") {
@@ -240,10 +338,32 @@ export async function onRequest(context: any) {
     if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
     const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
     const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
-    const epgUrl = epgList.join(",");
+    const epgUrl = epgList[0] || "";
     const m3u = await fetchAndBuild(sources, epgUrl);
-    try { await env.IPTV_KV.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: Date.now() })); } catch {}
+    try { await kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: Date.now() })); } catch {}
     return new Response("Refreshed", { status: 200 });
+  }
+
+  if (path === "/status") {
+    let cached: { m3u: string; updated_at: number } | null = null;
+    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw as any; } catch {}
+    const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
+    const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
+
+    const status = {
+      version: CACHE_VERSION,
+      cached: !!cached,
+      updated_at: cached ? new Date(cached.updated_at).toISOString() : null,
+      age_minutes: cached ? Math.floor((Date.now() - cached.updated_at) / 60000) : null,
+      sources_count: sources.length,
+      epg_sources: epgList,
+      active_epg: epgList[0] || "none",
+      groups: ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "互联网动漫", "互联网电影", "互联网电视剧"]
+    };
+
+    return new Response(JSON.stringify(status, null, 2), {
+      headers: { "Content-Type": "application/json; charset=utf-8" }
+    });
   }
 
   return new Response("Not Found", { status: 404 });
