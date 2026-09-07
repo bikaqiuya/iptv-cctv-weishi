@@ -7,7 +7,6 @@ const RATE_LIMIT = 20;                         // IP限流阈值
 
 // ========== 工具函数 ==========
 
-// 央视归一化
 function normalizeCCTV(name: string): string | null {
   const n = name.trim();
   const m = n.match(/^CCTV[-_ ]?(\d+)(\s*([\u4e00-\u9fa5]+))?/i);
@@ -23,14 +22,12 @@ function normalizeCCTV(name: string): string | null {
   return `CCTV-${num}${suffix ? " " + suffix : ""}`;
 }
 
-// 卫视归一化
 function normalizeSatellite(name: string): string | null {
   const n = name.trim();
   const m = n.match(/^([\u4e00-\u9fa5]{2,4})\s*卫视/i);
   return m ? `${m[1]}卫视` : null;
 }
 
-// 附加分类匹配
 function matchExtraCategories(name: string): string[] {
   const n = name.toLowerCase();
   const categories: string[] = [];
@@ -45,7 +42,6 @@ function matchExtraCategories(name: string): string[] {
   return categories;
 }
 
-// 互联网影视分类
 function matchInternetCategory(name: string): string | null {
   const n = name.toLowerCase();
 
@@ -73,7 +69,6 @@ function matchInternetCategory(name: string): string | null {
   return null;
 }
 
-// 主分组判定
 function getMainGroup(name: string): { keep: boolean; std: string; group: string } {
   const cctv = normalizeCCTV(name);
   if (cctv) return { keep: true, std: cctv, group: "央视" };
@@ -82,7 +77,6 @@ function getMainGroup(name: string): { keep: boolean; std: string; group: string
   return { keep: false, std: "", group: "" };
 }
 
-// 获取频道logo
 function getLogo(chanName: string): string {
   const cctvMatch = chanName.match(/^CCTV-(\d+)/);
   if (cctvMatch) {
@@ -95,7 +89,6 @@ function getLogo(chanName: string): string {
   return "";
 }
 
-// M3U过滤器
 function filterM3U(m3u: string, filter: string): string {
   const lines = m3u.split("\n");
   const filtered: string[] = [];
@@ -193,14 +186,27 @@ async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string>
     }
   }
 
-  // 生成 M3U
+  // ===== 生成 M3U =====
   let m3u = "#EXTM3U";
   if (epgUrl) m3u += ` url-tvg="${epgUrl}"`;
   m3u += "\n";
 
   const orderedGroups = ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "互联网动漫", "互联网电影", "互联网电视剧"];
 
-  // 央视数字排序
+  // ★ 构建 URL → 首次出现的频道名 映射
+  const urlFirstChan = new Map<string, string>();
+  for (const g of orderedGroups) {
+    const chanMap = groups[g];
+    if (!chanMap) continue;
+    for (const chan of Object.keys(chanMap)) {
+      for (const url of chanMap[chan]) {
+        if (!urlFirstChan.has(url)) {
+          urlFirstChan.set(url, chan);
+        }
+      }
+    }
+  }
+
   const cctvOrder = (a: string, b: string) => {
     const na = a.match(/CCTV-(\d+)/)?.[1] || "999";
     const nb = b.match(/CCTV-(\d+)/)?.[1] || "999";
@@ -218,6 +224,9 @@ async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string>
     }
     for (const chan of chanNames) {
       for (const url of chanMap[chan]) {
+        // ★ 不同频道名去重：只输出该 URL 第一次出现时的频道名
+        if (urlFirstChan.get(url) !== chan) continue;
+
         const logo = getLogo(chan);
         const logoAttr = logo ? ` tvg-logo="${logo}"` : "";
         m3u += `#EXTINF:-1 tvg-name="${chan}"${logoAttr} group-title="${g}",${chan}\n${url}\n`;
@@ -271,7 +280,7 @@ export async function onRequest(context: any) {
   const path = url.pathname;
   const kv = env.IPTV_KV;
 
-  // ===== IP限流 =====
+  // IP限流
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const rateKey = `rate_${ip}`;
   try {
@@ -293,31 +302,27 @@ export async function onRequest(context: any) {
 
     const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
     const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
-    const epgUrl = epgList[0] || ""; // 只取第一个EPG源
+    const epgUrl = epgList[0] || "";
     if (sources.length === 0) return new Response("SOURCES not configured", { status: 500 });
 
     const filter = url.searchParams.get("filter");
 
-    // ===== 缓存读取 =====
     let cached: { m3u: string; updated_at: number } | null = null;
     try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw as any; } catch {}
 
     const now = Date.now();
 
-    // 缓存有效
     if (cached && (now - cached.updated_at) < CACHE_TTL) {
       let output = cached.m3u;
       if (filter) output = filterM3U(output, filter);
       return new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
     }
 
-    // 缓存过期 → Stale-While-Revalidate：先返回旧数据，后台刷新
     if (cached && (now - cached.updated_at) >= CACHE_TTL) {
       let output = cached.m3u;
       if (filter) output = filterM3U(output, filter);
       const response = new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
 
-      // 后台异步刷新（不阻塞返回）
       fetchAndBuild(sources, epgUrl).then(m3u => {
         kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: Date.now() })).catch(() => {});
       }).catch(() => {});
@@ -325,7 +330,6 @@ export async function onRequest(context: any) {
       return response;
     }
 
-    // 无缓存 → 同步构建
     const m3u = await fetchAndBuild(sources, epgUrl);
     try { await kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: now })); } catch {}
     let output = m3u;
