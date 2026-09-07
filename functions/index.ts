@@ -1,9 +1,11 @@
 // ========== 配置 ==========
-const CACHE_VERSION = "v3";
+const CACHE_VERSION = "v4";
 const CACHE_KEY = `iptv_data_${CACHE_VERSION}`;
+const EPG_CACHE_KEY = "epg_xml_data";
 const CACHE_TTL = 12 * 60 * 60 * 1000;       // 12小时
-const FETCH_TIMEOUT = 8000;                    // 单源8秒超时
-const RATE_LIMIT = 20;                         // IP限流阈值
+const EPG_CACHE_TTL = 6 * 60 * 60 * 1000;    // EPG缓存6小时
+const FETCH_TIMEOUT = 8000;
+const RATE_LIMIT = 20;
 
 // ========== 工具函数 ==========
 
@@ -77,16 +79,38 @@ function getMainGroup(name: string): { keep: boolean; std: string; group: string
   return { keep: false, std: "", group: "" };
 }
 
+// ★ 完整台标：所有频道都尝试从 fanmingming CDN 获取
 function getLogo(chanName: string): string {
+  // 央视
   const cctvMatch = chanName.match(/^CCTV-(\d+)/);
   if (cctvMatch) {
     return `https://live.fanmingming.cn/tv/CCTV-${cctvMatch[1]}.png`;
   }
+  // 卫视
   const satMatch = chanName.match(/^([\u4e00-\u9fa5]{2,4})卫视/);
   if (satMatch) {
     return `https://live.fanmingming.cn/tv/${satMatch[1]}卫视.png`;
   }
-  return "";
+  // 其他频道：直接用频道名
+  return `https://live.fanmingming.cn/tv/${chanName}.png`;
+}
+
+// ★ 自动剔除无效 URL
+function isValidUrl(url: string): boolean {
+  if (!url || !url.trim()) return false;
+  try {
+    const u = new URL(url.trim());
+    // 只允许 http/https
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    // 剔除本地回环
+    const hostname = u.hostname.toLowerCase();
+    if (hostname === "localhost" || hostname === "0.0.0.0" || hostname === "127.0.0.1" || hostname === "::1") return false;
+    // 剔除内网地址
+    if (hostname.startsWith("192.168.") || hostname.startsWith("10.") || hostname.match(/^172\.(1[6-9]|2[0-9]|3[01])\./)) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function filterM3U(m3u: string, filter: string): string {
@@ -113,7 +137,7 @@ function filterM3U(m3u: string, filter: string): string {
 
 // ========== 拉取源 + 聚合 ==========
 
-async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string> {
+async function fetchAndBuild(sources: string[], epgUrl: string, chanAlias: Map<string, string>): Promise<string> {
   const groups: Record<string, Record<string, Set<string>>> = {};
 
   function addToGroup(group: string, stdName: string, url: string) {
@@ -154,12 +178,21 @@ async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string>
         continue;
       }
       if (trimmed && !trimmed.startsWith("#") && curName) {
-        const main = getMainGroup(curName);
+        // ★ 自动剔除无效 URL
+        if (!isValidUrl(trimmed)) {
+          curName = "";
+          continue;
+        }
+
+        // ★ 频道名模糊映射
+        let finalName = chanAlias.get(curName) || curName;
+
+        const main = getMainGroup(finalName);
         const groupHint = /央视|CCTV/i.test(curGroupFromSrc) ? "央视" :
                           /卫视/i.test(curGroupFromSrc) ? "卫视" : "";
 
         let assignedMain = "";
-        let stdName = curName;
+        let stdName = finalName;
 
         if (main.keep) {
           assignedMain = main.group;
@@ -175,9 +208,9 @@ async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string>
             addToGroup(cat, stdName, trimmed);
           }
         } else {
-          const internetCat = matchInternetCategory(curName);
+          const internetCat = matchInternetCategory(finalName);
           if (internetCat) {
-            addToGroup(internetCat, curName, trimmed);
+            addToGroup(internetCat, finalName, trimmed);
           }
         }
 
@@ -186,14 +219,15 @@ async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string>
     }
   }
 
-  // ===== 生成 M3U =====
+  // 生成 M3U
   let m3u = "#EXTM3U";
-  if (epgUrl) m3u += ` url-tvg="${epgUrl}"`;
+  // ★ EPG 指向自己的代理接口
+  m3u += ` url-tvg="/epg.xml"`;
   m3u += "\n";
 
   const orderedGroups = ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "互联网动漫", "互联网电影", "互联网电视剧"];
 
-  // ★ 构建 URL → 首次出现的频道名 映射
+  // 构建 URL → 首次出现的频道名 映射（跨频道名去重）
   const urlFirstChan = new Map<string, string>();
   for (const g of orderedGroups) {
     const chanMap = groups[g];
@@ -224,7 +258,6 @@ async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string>
     }
     for (const chan of chanNames) {
       for (const url of chanMap[chan]) {
-        // ★ 不同频道名去重：只输出该 URL 第一次出现时的频道名
         if (urlFirstChan.get(url) !== chan) continue;
 
         const logo = getLogo(chan);
@@ -295,17 +328,61 @@ export async function onRequest(context: any) {
     return new Response(HTML_HOME, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
+  // ★ EPG 代理接口（不需要鉴权，播放器自动请求）
+  if (path === "/epg.xml") {
+    // 尝试从缓存读取
+    try {
+      const cached = await kv.get(EPG_CACHE_KEY, "text");
+      if (cached) {
+        return new Response(cached, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
+      }
+    } catch {}
+
+    // 从环境变量拉取
+    const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
+    const epgUrl = epgList[0];
+    if (!epgUrl) {
+      return new Response("<!-- No EPG configured -->", { headers: { "Content-Type": "application/xml" } });
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const r = await fetch(epgUrl, {
+        signal: controller.signal,
+        headers: { "User-Agent": "Mozilla/5.0" }
+      });
+      clearTimeout(timeoutId);
+      if (r.ok) {
+        const xmlText = await r.text();
+        // 缓存到 KV
+        try { await kv.put(EPG_CACHE_KEY, xmlText, { expirationTtl: EPG_CACHE_TTL / 1000 }); } catch {}
+        return new Response(xmlText, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
+      }
+    } catch {}
+
+    return new Response("<!-- EPG fetch failed -->", { headers: { "Content-Type": "application/xml" } });
+  }
+
   if (path === "/iptv.m3u") {
     const key = url.searchParams.get("key");
     const authKey = env.AUTH_KEY;
     if (!authKey || key !== authKey) return new Response("Unauthorized", { status: 403 });
 
     const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
-    const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
-    const epgUrl = epgList[0] || "";
     if (sources.length === 0) return new Response("SOURCES not configured", { status: 500 });
 
     const filter = url.searchParams.get("filter");
+
+    // ★ 解析频道名模糊映射
+    const chanAlias = new Map<string, string>();
+    const aliasStr = env.CHAN_ALIAS || "";
+    if (aliasStr) {
+      aliasStr.split(",").forEach(pair => {
+        const [from, to] = pair.split("=").map(s => s.trim());
+        if (from && to) chanAlias.set(from, to);
+      });
+    }
 
     let cached: { m3u: string; updated_at: number } | null = null;
     try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw as any; } catch {}
@@ -323,14 +400,14 @@ export async function onRequest(context: any) {
       if (filter) output = filterM3U(output, filter);
       const response = new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
 
-      fetchAndBuild(sources, epgUrl).then(m3u => {
+      fetchAndBuild(sources, "", chanAlias).then(m3u => {
         kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: Date.now() })).catch(() => {});
       }).catch(() => {});
 
       return response;
     }
 
-    const m3u = await fetchAndBuild(sources, epgUrl);
+    const m3u = await fetchAndBuild(sources, "", chanAlias);
     try { await kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: now })); } catch {}
     let output = m3u;
     if (filter) output = filterM3U(output, filter);
@@ -340,10 +417,18 @@ export async function onRequest(context: any) {
   if (path === "/refresh") {
     const key = url.searchParams.get("key");
     if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
+
     const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
-    const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
-    const epgUrl = epgList[0] || "";
-    const m3u = await fetchAndBuild(sources, epgUrl);
+    const chanAlias = new Map<string, string>();
+    const aliasStr = env.CHAN_ALIAS || "";
+    if (aliasStr) {
+      aliasStr.split(",").forEach(pair => {
+        const [from, to] = pair.split("=").map(s => s.trim());
+        if (from && to) chanAlias.set(from, to);
+      });
+    }
+
+    const m3u = await fetchAndBuild(sources, "", chanAlias);
     try { await kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: Date.now() })); } catch {}
     return new Response("Refreshed", { status: 200 });
   }
@@ -361,7 +446,7 @@ export async function onRequest(context: any) {
       age_minutes: cached ? Math.floor((Date.now() - cached.updated_at) / 60000) : null,
       sources_count: sources.length,
       epg_sources: epgList,
-      active_epg: epgList[0] || "none",
+      epg_proxy: "/epg.xml",
       groups: ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "互联网动漫", "互联网电影", "互联网电视剧"]
     };
 
