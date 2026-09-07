@@ -11,9 +11,7 @@ KV变量名  IPTV_KV，                EdgeOne KV Namespace，用于存储缓存
 
 部署在edgeone的makers上：部署步骤（GitHub → EdgeOne Makers）
 第一步：GitHub
-
 把以上文件 push 到你的 GitHub 仓库或者fork。
-
 第二步：EdgeOne Makers 控制台
 创建 Makers 项目 → 导入 GitHub 仓库。
 设置环境变量：
