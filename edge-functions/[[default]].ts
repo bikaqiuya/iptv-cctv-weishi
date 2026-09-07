@@ -14,25 +14,44 @@ const ORDERED_GROUPS = ["央视", "卫视", "高清", "少儿", "音乐", "动�
 
 // ========== 工具函数 ==========
 
+// ★ 央视名称标准化
 function normalizeCCTV(name: string): string | null {
-  const n = name.trim();
-  const m = n.match(/^CCTV[-_ ]?(\d+)(\s*([\u4e00-\u9fa5]+))?/i);
+  const n = name.trim().toLowerCase().replace(/\s+/g, "");
+  // 匹配 cctv1, cctv-1, cctv01, cctv-01 等
+  const m = n.match(/^cctv-?(\d{1,2})$/);
   if (!m) return null;
-  const num = m[1];
+  const num = parseInt(m[1]).toString();
   const names: Record<string, string> = {
     "1": "综合", "2": "财经", "3": "综艺", "4": "中文国际",
     "5": "体育", "6": "电影", "7": "国防军事", "8": "电视剧",
     "9": "纪录", "10": "科教", "11": "戏曲", "12": "社会与法",
     "13": "新闻", "14": "少儿", "15": "音乐", "16": "奥林匹克", "17": "4K 超高清"
   };
-  const suffix = m[3] ? m[3] : (names[num] || "");
+  const suffix = names[num] || "";
   return `CCTV-${num}${suffix ? " " + suffix : ""}`;
 }
 
+// ★ 卫视名称标准化
 function normalizeSatellite(name: string): string | null {
   const n = name.trim();
-  const m = n.match(/^([\u4e00-\u9fa5]{2,4})\s*卫视/i);
+  // 匹配 "湖南 卫视"、"湖南卫视"、"湖南 卫星电视" 等
+  const m = n.match(/^([\u4e00-\u9fa5]{2,4})\s*卫视/);
   return m ? `${m[1]}卫视` : null;
+}
+
+// ★ 通用名称标准化入口
+function standardizeName(name: string, aliasMap: Map<string, string>): string {
+  // 1. 先试央视标准化
+  const cctv = normalizeCCTV(name);
+  if (cctv) return cctv;
+  // 2. 再试卫视标准化
+  const sat = normalizeSatellite(name);
+  if (sat) return sat;
+  // 3. 检查自定义别名
+  const trimmed = name.trim();
+  if (aliasMap.has(trimmed)) return aliasMap.get(trimmed)!;
+  // 4. 原样返回
+  return trimmed;
 }
 
 // ★ 额外分类匹配（对所有频道生效）
@@ -62,14 +81,6 @@ function matchInternetCategory(name: string): string | null {
   if (/电影|影院|剧场版|film|movie|cinema/.test(n)) return "互联网电影";
   if (/^[\u4e00-\u9fa5]{2,15}$/.test(name)) return "互联网电影";
   return null;
-}
-
-function getMainGroup(name: string): { keep: boolean; std: string; group: string } {
-  const cctv = normalizeCCTV(name);
-  if (cctv) return { keep: true, std: cctv, group: "央视" };
-  const sat = normalizeSatellite(name);
-  if (sat) return { keep: true, std: sat, group: "卫视" };
-  return { keep: false, std: "", group: "" };
 }
 
 function getLogo(chanName: string): string {
@@ -181,7 +192,8 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
         if (blacklist.has(trimmed)) { curName = ""; continue; }
         if (!isValidUrl(trimmed)) { curName = ""; continue; }
 
-        let finalName = chanAlias.get(curName) || curName;
+        // ★ 名称标准化（核心：统一 cctv1/cctv-1/CCTV-1综合 等）
+        let finalName = standardizeName(curName, chanAlias);
         const { cleanName, isHighDef } = extractTags(finalName);
         finalName = cleanName;
 
@@ -192,15 +204,16 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
           if (curTvgShift) chanMeta[finalName].tvgShift = curTvgShift;
         }
 
-        const main = getMainGroup(finalName);
-
-        // ★ 分组决策：只归入白名单分组
+        // 主分组决策
         let assignedGroup = "";
+        const cctvMatch = finalName.match(/^CCTV-\d+/);
+        const satMatch = finalName.match(/^[\u4e00-\u9fa5]{2,4}卫视/);
 
-        if (main.keep) {
-          assignedGroup = main.group; // "央视" 或 "卫视"
+        if (cctvMatch) {
+          assignedGroup = "央视";
+        } else if (satMatch) {
+          assignedGroup = "卫视";
         } else {
-          // 尝试互联网分类
           const internetCat = matchInternetCategory(finalName);
           if (internetCat && ORDERED_GROUPS.includes(internetCat)) {
             assignedGroup = internetCat;
@@ -209,7 +222,7 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
           }
         }
 
-        // ★ 如果无法归入任何白名单主分组，直接丢弃
+        // ★ 无法归入白名单主分组 → 直接丢弃
         if (!assignedGroup || !ORDERED_GROUPS.includes(assignedGroup)) {
           curName = "";
           continue;
@@ -383,7 +396,7 @@ export async function onRequest(context: any) {
     if (!epgUrl) return new Response("<!-- No EPG -->", { headers: { "Content-Type": "application/xml" } });
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 25000); // EPG 25 秒
+      const timeoutId = setTimeout(() => controller.abort(), 25000);
       const r = await fetch(epgUrl, { signal: controller.signal, headers: { "User-Agent": "Mozilla/5.0" } });
       clearTimeout(timeoutId);
       if (r.ok) {
