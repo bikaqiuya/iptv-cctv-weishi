@@ -1,0 +1,7 @@
+{
+  "name": "iptv-cctv-sat",
+  "private": true,
+  "scripts": {
+    "dev": "edgeone makers dev"
+  }
+}
