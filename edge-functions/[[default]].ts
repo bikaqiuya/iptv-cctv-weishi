@@ -6,10 +6,11 @@ const EPG_CACHE_KEY = "epg_xml_data";
 const BLACKLIST_KEY = "url_blacklist";
 const CACHE_TTL = 12 * 60 * 60 * 1000;
 const EPG_CACHE_TTL = 6 * 60 * 60 * 1000;
-const FETCH_TIMEOUT = 8000;
+const FETCH_TIMEOUT = 12000; // 12 秒
 const RATE_LIMIT = 20;
 
-const ORDERED_GROUPS = ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "互联网动漫", "互联网电影", "互联网电视剧"];
+// 固定输出分组（白名单）
+const ORDERED_GROUPS = ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "体育", "电影", "新闻", "互联网动漫", "互联网电影", "互联网电视剧"];
 
 // ========== 工具函数 ==========
 
@@ -34,15 +35,19 @@ function normalizeSatellite(name: string): string | null {
   return m ? `${m[1]}卫视` : null;
 }
 
+// ★ 额外分类匹配（对所有频道生效）
 function matchExtraCategories(name: string): string[] {
   const n = name.toLowerCase();
   const categories: string[] = [];
-  if (/少儿|儿童|kids/.test(n)) categories.push("少儿");
-  if (/音乐|music/.test(n)) categories.push("音乐");
-  if (/动漫|动画|卡通|anime|comic/.test(n)) categories.push("动漫");
-  if (/戏曲|京剧|越剧|黄梅戏|豫剧|昆曲|梨园/.test(n)) categories.push("戏曲");
-  if (/纪录|纪录片|纪实|动物世界|人与自然|探索频道|discovery|国家地理|nat\s*geo|national\s*geographic/.test(n)) categories.push("纪录片");
-  if (/hd|2k|4k|高清|超清|高画质|fhd|uhd|蓝光|blu-ray/.test(n)) categories.push("高清");
+  if (/少儿|儿童|kids|卡通|动画|动漫/.test(n)) categories.push("少儿");
+  if (/音乐|music|mtv|演唱会|音乐会/.test(n)) categories.push("音乐");
+  if (/戏曲|京剧|越剧|黄梅戏|豫剧|昆曲|梨园|戏剧|曲苑/.test(n)) categories.push("戏曲");
+  if (/纪录|纪录片|纪实|探索|动物|自然|历史|地理|discovery|国家地理/.test(n)) categories.push("纪录片");
+  if (/体育|足球|篮球|nba|cctv-?5|赛事|sports|网球|乒乓球|羽毛球/.test(n)) categories.push("体育");
+  if (/电影|影院|剧场版|film|movie|cinema|cctv-?6/.test(n)) categories.push("电影");
+  if (/新闻|资讯|news|cctv-?13|时事/.test(n)) categories.push("新闻");
+  if (/hd|2k|4k|高清|超清|蓝光|uhd|fhd|hdr|hevc|h265/.test(n)) categories.push("高清");
+  if (/动漫|anime|comic|番|二次元|漫画/.test(n)) categories.push("动漫");
   return categories;
 }
 
@@ -81,7 +86,7 @@ function isValidUrl(url: string): boolean {
     const u = new URL(url.trim());
     if (u.protocol !== "http:" && u.protocol !== "https:") return false;
     const hostname = u.hostname.toLowerCase();
-    if (hostname === "localhost" || hostname === "0.0.0.0" || hostname === "127.0.0.1" || hostname === "::1") return false;
+    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") return false;
     if (hostname.startsWith("192.168.") || hostname.startsWith("10.") || hostname.match(/^172\.(1[6-9]|2[0-9]|3[01])\./)) return false;
     return true;
   } catch { return false; }
@@ -188,34 +193,45 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
         }
 
         const main = getMainGroup(finalName);
-        const groupHint = /央视|CCTV/i.test(curGroupFromSrc) ? "央视" :
-                          /卫视/i.test(curGroupFromSrc) ? "卫视" : "";
 
-        let assignedMain = "";
-        let stdName = finalName;
+        // ★ 分组决策：只归入白名单分组
+        let assignedGroup = "";
 
         if (main.keep) {
-          assignedMain = main.group;
-          stdName = main.std;
-        } else if (groupHint) {
-          assignedMain = groupHint;
-        }
-
-        if (!assignedMain && isHighDef) assignedMain = "高清";
-
-        if (assignedMain) {
-          addToGroup(assignedMain, stdName, trimmed);
-          const extras = matchExtraCategories(stdName);
-          for (const cat of extras) addToGroup(cat, stdName, trimmed);
+          assignedGroup = main.group; // "央视" 或 "卫视"
         } else {
+          // 尝试互联网分类
           const internetCat = matchInternetCategory(finalName);
-          if (internetCat) addToGroup(internetCat, finalName, trimmed);
+          if (internetCat && ORDERED_GROUPS.includes(internetCat)) {
+            assignedGroup = internetCat;
+          } else if (isHighDef) {
+            assignedGroup = "高清";
+          }
         }
+
+        // ★ 如果无法归入任何白名单主分组，直接丢弃
+        if (!assignedGroup || !ORDERED_GROUPS.includes(assignedGroup)) {
+          curName = "";
+          continue;
+        }
+
+        // ★ 写入主分组
+        addToGroup(assignedGroup, finalName, trimmed);
+
+        // ★ 额外分类匹配（对所有已保留频道生效）
+        const extras = matchExtraCategories(finalName);
+        for (const cat of extras) {
+          if (ORDERED_GROUPS.includes(cat)) {
+            addToGroup(cat, finalName, trimmed);
+          }
+        }
+
         curName = "";
       }
     }
   }
 
+  // ===== 生成 M3U（只输出 ORDERED_GROUPS 中存在的分组）=====
   let m3u = "#EXTM3U\n";
 
   const urlFirstChan = new Map<string, string>();
@@ -257,6 +273,7 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
     }
   }
 
+  // ===== 构建 Xtream Codes API 数据 =====
   const categories = ORDERED_GROUPS.map((g, i) => ({
     category_id: i + 1,
     category_name: g,
@@ -335,8 +352,7 @@ export async function onRequest(context: any) {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  // ★ 核心修复：EdgeOne Makers 的 KV 绑定通过全局变量访问
-  // 优先用全局变量 IPTV_KV，兜底用 env.IPTV_KV
+  // ★ EdgeOne Makers KV 全局变量
   const kv = (typeof IPTV_KV !== 'undefined') ? IPTV_KV : env.IPTV_KV;
 
   if (!kv) {
@@ -367,7 +383,7 @@ export async function onRequest(context: any) {
     if (!epgUrl) return new Response("<!-- No EPG -->", { headers: { "Content-Type": "application/xml" } });
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const timeoutId = setTimeout(() => controller.abort(), 25000); // EPG 25 秒
       const r = await fetch(epgUrl, { signal: controller.signal, headers: { "User-Agent": "Mozilla/5.0" } });
       clearTimeout(timeoutId);
       if (r.ok) {
