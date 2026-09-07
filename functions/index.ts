@@ -1,5 +1,6 @@
-// ========== 工具函数：央视/卫视归一化（同上版，略作精简） ==========
+// ========== 工具函数 ==========
 
+// 央视归一化
 function normalizeCCTV(name: string): string | null {
   const n = name.trim();
   const m = n.match(/^CCTV[-_ ]?(\d+)(\s*([\u4e00-\u9fa5]+))?/i);
@@ -9,19 +10,50 @@ function normalizeCCTV(name: string): string | null {
     "1": "综合", "2": "财经", "3": "综艺", "4": "中文国际",
     "5": "体育", "6": "电影", "7": "国防军事", "8": "电视剧",
     "9": "纪录", "10": "科教", "11": "戏曲", "12": "社会与法",
-    "13": "新闻", "14": "音乐", "15": "少儿", "16": "奥林匹克", "17": "4K 超高清"
+    "13": "新闻", "14": "少儿", "15": "音乐", "16": "奥林匹克", "17": "4K 超高清"
   };
   const suffix = m[3] ? m[3] : (names[num] || "");
   return `CCTV-${num}${suffix ? " " + suffix : ""}`;
 }
 
+// 卫视归一化
 function normalizeSatellite(name: string): string | null {
   const n = name.trim();
   const m = n.match(/^([\u4e00-\u9fa5]{2,4})\s*卫视/i);
   return m ? `${m[1]}卫视` : null;
 }
 
-function isCCTVOrSat(name: string): { keep: boolean; std: string; group: string } {
+// 新分类匹配：返回该频道应归属的所有"附加分类"
+function matchExtraCategories(name: string): string[] {
+  const n = name.toLowerCase();
+  const categories: string[] = [];
+
+  // 少儿：少儿 / 儿童 / kids
+  if (/少儿|儿童|kids/.test(n)) {
+    categories.push("少儿");
+  }
+
+  // 音乐：音乐 / music
+  if (/音乐|music/.test(n)) {
+    categories.push("音乐");
+  }
+
+  // 动漫：动漫 / 动画 / 卡通 / anime / comic
+  // 注意：金鹰卡通、卡酷卡通等"卡通"后缀少儿频道也归到动漫
+  if (/动漫|动画|卡通|anime|comic/.test(n)) {
+    categories.push("动漫");
+  }
+
+  // 戏曲：戏曲 / 京剧 / 越剧 / 黄梅戏 / 梨园
+  if (/戏曲|京剧|越剧|黄梅戏|豫剧|昆曲|梨园/.test(n)) {
+    categories.push("戏曲");
+  }
+
+  return categories;
+}
+
+// 主分组判定（央视 / 卫视 / 其他）
+function getMainGroup(name: string): { keep: boolean; std: string; group: string } {
   const cctv = normalizeCCTV(name);
   if (cctv) return { keep: true, std: cctv, group: "央视" };
   const sat = normalizeSatellite(name);
@@ -29,10 +61,17 @@ function isCCTVOrSat(name: string): { keep: boolean; std: string; group: string 
   return { keep: false, std: "", group: "" };
 }
 
-// ========== 核心：拉取源 + 聚合 ==========
+// ========== 拉取源 + 聚合（支持多分组） ==========
 
 async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string> {
-  const groups: Record<string, { group: string; urls: Set<string> }> = {};
+  // groups[分类名][标准频道名] = Set<url>
+  const groups: Record<string, Record<string, Set<string>>> = {};
+
+  function addToGroup(group: string, stdName: string, url: string) {
+    if (!groups[group]) groups[group] = {};
+    if (!groups[group][stdName]) groups[group][stdName] = new Set();
+    groups[group][stdName].add(url);
+  }
 
   const results = await Promise.all(
     sources.map(async (url) => {
@@ -49,46 +88,76 @@ async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string>
     if (!text) continue;
     const lines = text.split(/\r?\n/);
     let curName = "";
-    let curGroup = "";
+    let curGroupFromSrc = "";
     for (const line of lines) {
       const trimmed = line.trim();
       if (trimmed.startsWith("#EXTINF")) {
         const commaIdx = trimmed.indexOf(",");
         curName = commaIdx >= 0 ? trimmed.substring(commaIdx + 1).trim() : "";
         const grpMatch = trimmed.match(/group-title="([^"]*)"/i);
-        curGroup = grpMatch ? grpMatch[1] : "";
+        curGroupFromSrc = grpMatch ? grpMatch[1] : "";
         continue;
       }
       if (trimmed && !trimmed.startsWith("#") && curName) {
-        const judge = isCCTVOrSat(curName);
-        const groupHint = /央视|CCTV/i.test(curGroup) ? "央视" : /卫视/i.test(curGroup) ? "卫视" : "";
-        if (judge.keep || groupHint) {
-          const std = judge.std || curName;
-          const grp = judge.group || groupHint;
-          if (!groups[std]) groups[std] = { group: grp, urls: new Set() };
-          groups[std].urls.add(trimmed);
+        const main = getMainGroup(curName);
+
+        // 主分组判定：名称归一化 OR 源里 group-title 已标明
+        const groupHint = /央视|CCTV/i.test(curGroupFromSrc) ? "央视" :
+                          /卫视/i.test(curGroupFromSrc) ? "卫视" : "";
+
+        let assignedMain = "";
+        let stdName = curName;
+
+        if (main.keep) {
+          assignedMain = main.group;
+          stdName = main.std;
+        } else if (groupHint) {
+          assignedMain = groupHint;
         }
+
+        if (assignedMain) {
+          // 1) 加入主分组（央视 / 卫视）
+          addToGroup(assignedMain, stdName, trimmed);
+
+          // 2) 额外分类（少儿 / 音乐 / 动漫 / 戏曲）
+          const extras = matchExtraCategories(stdName);
+          for (const cat of extras) {
+            // 用标准频道名归到附加分类，保证同一频道多链接聚合
+            addToGroup(cat, stdName, trimmed);
+          }
+        }
+
         curName = "";
       }
     }
   }
 
+  // ========== 生成 M3U ==========
   let m3u = "#EXTM3U";
   if (epgUrl) m3u += ` url-tvg="${epgUrl}"`;
   m3u += "\n";
 
-  const cctvKeys = Object.keys(groups).filter(k => groups[k].group === "央视").sort();
-  const satKeys = Object.keys(groups).filter(k => groups[k].group === "卫视").sort();
+  // 分组顺序：央视 → 卫视 → 少儿 → 音乐 → 动漫 → 戏曲
+  const orderedGroups = ["央视", "卫视", "少儿", "音乐", "动漫", "戏曲"];
 
-  for (const k of [...cctvKeys, ...satKeys]) {
-    for (const url of groups[k].urls) {
-      m3u += `#EXTINF:-1 tvg-name="${k}" group-title="${groups[k].group}",${k}\n${url}\n`;
+  for (const g of orderedGroups) {
+    const chanMap = groups[g];
+    if (!chanMap) continue;
+
+    // 频道名排序
+    const chanNames = Object.keys(chanMap).sort((a, b) => a.localeCompare(b));
+
+    for (const chan of chanNames) {
+      for (const url of chanMap[chan]) {
+        m3u += `#EXTINF:-1 tvg-name="${chan}" group-title="${g}",${chan}\n${url}\n`;
+      }
     }
   }
+
   return m3u;
 }
 
-// ========== 伪装主页 HTML ==========
+// ========== 伪装主页 ==========
 
 const HTML_HOME = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -131,7 +200,7 @@ export async function onRequest(context: any) {
     });
   }
 
-  // 2. 订阅接口：/iptv.m3u?key=xxx
+  // 2. 订阅接口
   if (path === "/iptv.m3u") {
     const key = url.searchParams.get("key");
     const authKey = env.AUTH_KEY;
@@ -150,18 +219,17 @@ export async function onRequest(context: any) {
 
     const kv = env.IPTV_KV;
     const CACHE_KEY = "iptv_data";
-    const CACHE_TTL = 12 * 60 * 60 * 1000; // 12小时
+    const CACHE_TTL = 12 * 60 * 60 * 1000; // 12 小时
 
-    // 尝试读缓存
+    // 读缓存
     let cached: { m3u: string; updated_at: number } | null = null;
     try {
-      const raw = await kv.get(CACHE_KEY);
-      if (raw) cached = JSON.parse(raw);
+      const raw = await kv.get(CACHE_KEY, "json");
+      if (raw) cached = raw as any;
     } catch {}
 
     const now = Date.now();
     if (cached && (now - cached.updated_at) < CACHE_TTL) {
-      // 缓存有效，直接返回
       return new Response(cached.m3u, {
         headers: {
           "Content-Type": "application/vnd.apple.mpegurl",
@@ -170,10 +238,10 @@ export async function onRequest(context: any) {
       });
     }
 
-    // 缓存过期或不存在，重新生成
+    // 重新生成
     const m3u = await fetchAndBuild(sources, epgUrl);
 
-    // 写入 KV（KV 本身没有 TTL 自动删除，靠时间戳逻辑控制）
+    // 写回 KV
     try {
       await kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: now }));
     } catch {}
@@ -186,6 +254,22 @@ export async function onRequest(context: any) {
     });
   }
 
-  // 3. 其他路径 404
+  // 可选：手动刷新缓存接口 /refresh?key=xxx
+  if (path === "/refresh") {
+    const key = url.searchParams.get("key");
+    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
+
+    const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
+    const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
+    const epgUrl = epgList.join(",");
+    const m3u = await fetchAndBuild(sources, epgUrl);
+
+    try {
+      await env.IPTV_KV.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: Date.now() }));
+    } catch {}
+
+    return new Response("Refreshed", { status: 200 });
+  }
+
   return new Response("Not Found", { status: 404 });
 }
