@@ -1,28 +1,24 @@
-// 央视规范化：把 cctv1 / CCTV-1 / cctv1综合 / CCTV-1综合 统一成 "CCTV-1 综合"
+// ========== 工具函数：央视/卫视归一化（同上版，略作精简） ==========
+
 function normalizeCCTV(name: string): string | null {
   const n = name.trim();
-  // 匹配 CCTV 后跟数字，可能有 - 或没有
   const m = n.match(/^CCTV[-_ ]?(\d+)(\s*([\u4e00-\u9fa5]+))?/i);
   if (!m) return null;
   const num = m[1];
-  // 根据频道号补全标准名称
   const names: Record<string, string> = {
     "1": "综合", "2": "财经", "3": "综艺", "4": "中文国际",
     "5": "体育", "6": "电影", "7": "国防军事", "8": "电视剧",
     "9": "纪录", "10": "科教", "11": "戏曲", "12": "社会与法",
-    "13": "新闻", "14": "音乐", "15": "少儿", "16": "奥林匹克",
-    "17": "4K 超高清"
+    "13": "新闻", "14": "音乐", "15": "少儿", "16": "奥林匹克", "17": "4K 超高清"
   };
   const suffix = m[3] ? m[3] : (names[num] || "");
   return `CCTV-${num}${suffix ? " " + suffix : ""}`;
 }
 
-// 卫视匹配：识别 "XX卫视" 或 "XX卫视HD" 等
 function normalizeSatellite(name: string): string | null {
   const n = name.trim();
   const m = n.match(/^([\u4e00-\u9fa5]{2,4})\s*卫视/i);
-  if (!m) return null;
-  return `${m[1]}卫视`;
+  return m ? `${m[1]}卫视` : null;
 }
 
 function isCCTVOrSat(name: string): { keep: boolean; std: string; group: string } {
@@ -33,21 +29,15 @@ function isCCTVOrSat(name: string): { keep: boolean; std: string; group: string 
   return { keep: false, std: "", group: "" };
 }
 
-export async function onRequest(context: any) {
-  const env = context.env;
-  const sources = (env.SOURCES || "").split("|").map(s => s.trim()).filter(Boolean);
-  const epgUrl = env.EPG_URL || "";
-  const ttl = parseInt(env.CACHE_TTL || "3600", 10);
+// ========== 核心：拉取源 + 聚合 ==========
 
-  if (sources.length === 0) {
-    return new Response("SOURCES env not set", { status: 500 });
-  }
+async function fetchAndBuild(sources: string[], epgUrl: string): Promise<string> {
+  const groups: Record<string, { group: string; urls: Set<string> }> = {};
 
-  // 并发拉取所有订阅源
   const results = await Promise.all(
     sources.map(async (url) => {
       try {
-        const r = await fetch(url, { cf: { cacheTtl: ttl } });
+        const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
         return r.ok ? await r.text() : "";
       } catch {
         return "";
@@ -55,64 +45,147 @@ export async function onRequest(context: any) {
     })
   );
 
-  // 逐行解析 M3U，聚合同一标准频道名的多链接
-  const groups: Record<string, { group: string; urls: Set<string> }> = {};
-
   for (const text of results) {
     if (!text) continue;
     const lines = text.split(/\r?\n/);
     let curName = "";
     let curGroup = "";
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (line.startsWith("#EXTINF")) {
-        // 提取 tvg-name 或逗号后的显示名
-        const commaIdx = line.indexOf(",");
-        curName = commaIdx >= 0 ? line.substring(commaIdx + 1).trim() : "";
-        const grpMatch = line.match(/group-title="([^"]*)"/i);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("#EXTINF")) {
+        const commaIdx = trimmed.indexOf(",");
+        curName = commaIdx >= 0 ? trimmed.substring(commaIdx + 1).trim() : "";
+        const grpMatch = trimmed.match(/group-title="([^"]*)"/i);
         curGroup = grpMatch ? grpMatch[1] : "";
         continue;
       }
-      if (line && !line.startsWith("#") && curName) {
-        const url = line;
+      if (trimmed && !trimmed.startsWith("#") && curName) {
         const judge = isCCTVOrSat(curName);
-        // 若 group-title 已明确标注央视/卫视，也纳入
-        const groupHint = /央视|CCTV/i.test(curGroup) ? "央视" :
-                          /卫视/i.test(curGroup) ? "卫视" : "";
+        const groupHint = /央视|CCTV/i.test(curGroup) ? "央视" : /卫视/i.test(curGroup) ? "卫视" : "";
         if (judge.keep || groupHint) {
           const std = judge.std || curName;
           const grp = judge.group || groupHint;
           if (!groups[std]) groups[std] = { group: grp, urls: new Set() };
-          groups[std].urls.add(url);
+          groups[std].urls.add(trimmed);
         }
         curName = "";
       }
     }
   }
 
-  // 生成 M3U
   let m3u = "#EXTM3U";
-  if (epgUrl) {
-    m3u += ` url-tvg="${epgUrl}"`;
-  }
+  if (epgUrl) m3u += ` url-tvg="${epgUrl}"`;
   m3u += "\n";
 
-  // 央视在前、卫视在后
-  const cctvKeys = Object.keys(groups).filter(k => groups[k].group === "央视")
-    .sort((a, b) => a.localeCompare(b));
-  const satKeys = Object.keys(groups).filter(k => groups[k].group === "卫视")
-    .sort((a, b) => a.localeCompare(b));
+  const cctvKeys = Object.keys(groups).filter(k => groups[k].group === "央视").sort();
+  const satKeys = Object.keys(groups).filter(k => groups[k].group === "卫视").sort();
 
   for (const k of [...cctvKeys, ...satKeys]) {
     for (const url of groups[k].urls) {
       m3u += `#EXTINF:-1 tvg-name="${k}" group-title="${groups[k].group}",${k}\n${url}\n`;
     }
   }
+  return m3u;
+}
 
-  return new Response(m3u, {
-    headers: {
-      "Content-Type": "application/vnd.apple.mpegurl",
-      "Cache-Control": `public, max-age=${ttl}`,
-    },
-  });
+// ========== 伪装主页 HTML ==========
+
+const HTML_HOME = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>影视资源导航</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 40px; }
+    .container { max-width: 800px; margin: 0 auto; text-align: center; }
+    h1 { font-size: 2.5em; margin-bottom: 0.5em; }
+    p { color: #94a3b8; line-height: 1.8; }
+    .card { background: #1e293b; border-radius: 12px; padding: 30px; margin-top: 30px; }
+    .footer { margin-top: 40px; font-size: 0.85em; color: #64748b; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎬 影视资源导航站</h1>
+    <div class="card">
+      <p>本站点提供优质的影视节目聚合服务。</p>
+      <p>使用正版播放器，享受高清流畅的观看体验。</p>
+    </div>
+    <div class="footer">© 2026 IPTV Service | Powered by EdgeOne</div>
+  </div>
+</body>
+</html>`;
+
+// ========== 入口 ==========
+
+export async function onRequest(context: any) {
+  const { request, env } = context;
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  // 1. 伪装主页
+  if (path === "/" || path === "/index.html") {
+    return new Response(HTML_HOME, {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+  }
+
+  // 2. 订阅接口：/iptv.m3u?key=xxx
+  if (path === "/iptv.m3u") {
+    const key = url.searchParams.get("key");
+    const authKey = env.AUTH_KEY;
+
+    if (!authKey || key !== authKey) {
+      return new Response("Unauthorized", { status: 403 });
+    }
+
+    const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
+    const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
+    const epgUrl = epgList.join(",");
+
+    if (sources.length === 0) {
+      return new Response("SOURCES not configured", { status: 500 });
+    }
+
+    const kv = env.IPTV_KV;
+    const CACHE_KEY = "iptv_data";
+    const CACHE_TTL = 12 * 60 * 60 * 1000; // 12小时
+
+    // 尝试读缓存
+    let cached: { m3u: string; updated_at: number } | null = null;
+    try {
+      const raw = await kv.get(CACHE_KEY);
+      if (raw) cached = JSON.parse(raw);
+    } catch {}
+
+    const now = Date.now();
+    if (cached && (now - cached.updated_at) < CACHE_TTL) {
+      // 缓存有效，直接返回
+      return new Response(cached.m3u, {
+        headers: {
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Cache-Control": "no-cache",
+        },
+      });
+    }
+
+    // 缓存过期或不存在，重新生成
+    const m3u = await fetchAndBuild(sources, epgUrl);
+
+    // 写入 KV（KV 本身没有 TTL 自动删除，靠时间戳逻辑控制）
+    try {
+      await kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: now }));
+    } catch {}
+
+    return new Response(m3u, {
+      headers: {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Cache-Control": "no-cache",
+      },
+    });
+  }
+
+  // 3. 其他路径 404
+  return new Response("Not Found", { status: 404 });
 }
