@@ -120,19 +120,11 @@ function filterM3U(m3u: string, filter: string): string {
 // ========== 拉取源 + 聚合 ==========
 
 async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, kv: any): Promise<{ m3u: string; apiData: any }> {
-  console.log(`[fetchAndBuild] 开始，共 ${sources.length} 个源`);
-
-  // 加载黑名单
   let blacklist: Set<string> = new Set();
   try {
     const bl = await kv.get(BLACKLIST_KEY, "json");
-    if (bl && Array.isArray(bl)) {
-      blacklist = new Set(bl);
-      console.log(`[fetchAndBuild] 黑名单加载成功，共 ${bl.length} 条`);
-    }
-  } catch (e) {
-    console.error(`[fetchAndBuild] 黑名单加载失败: ${e.message}`);
-  }
+    if (bl && Array.isArray(bl)) blacklist = new Set(bl);
+  } catch {}
 
   const groups: Record<string, Record<string, Set<string>>> = {};
   const chanMeta: Record<string, { tvgId?: string; tvgLogo?: string; tvgShift?: string }> = {};
@@ -144,29 +136,17 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
   }
 
   const results = await Promise.all(
-    sources.map(async (url, idx) => {
+    sources.map(async (url) => {
       try {
-        console.log(`[fetchAndBuild] 抓取源 ${idx + 1}: ${url.substring(0, 60)}...`);
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
         const r = await fetch(url, { signal: controller.signal, headers: { "User-Agent": "Mozilla/5.0" } });
         clearTimeout(timeoutId);
-        if (r.ok) {
-          const text = await r.text();
-          console.log(`[fetchAndBuild] 源 ${idx + 1} 抓取成功，长度 ${text.length}`);
-          return text;
-        } else {
-          console.error(`[fetchAndBuild] 源 ${idx + 1} HTTP ${r.status}`);
-          return "";
-        }
-      } catch (e) {
-        console.error(`[fetchAndBuild] 源 ${idx + 1} 抓取失败: ${e.message}`);
-        return "";
-      }
+        return r.ok ? await r.text() : "";
+      } catch { return ""; }
     })
   );
 
-  let totalChannels = 0;
   for (const text of results) {
     if (!text) continue;
     const lines = text.split(/\r?\n/);
@@ -231,15 +211,11 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
           const internetCat = matchInternetCategory(finalName);
           if (internetCat) addToGroup(internetCat, finalName, trimmed);
         }
-        totalChannels++;
         curName = "";
       }
     }
   }
 
-  console.log(`[fetchAndBuild] 解析完成，共处理 ${totalChannels} 个频道条目`);
-
-  // ===== 生成 M3U =====
   let m3u = "#EXTM3U\n";
 
   const urlFirstChan = new Map<string, string>();
@@ -281,9 +257,6 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
     }
   }
 
-  console.log(`[fetchAndBuild] M3U 生成完成，长度 ${m3u.length}`);
-
-  // ===== 构建 Xtream Codes API 数据 =====
   const categories = ORDERED_GROUPS.map((g, i) => ({
     category_id: i + 1,
     category_name: g,
@@ -316,8 +289,6 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
       }
     }
   }
-
-  console.log(`[fetchAndBuild] API 数据构建完成，共 ${streams.length} 个流`);
 
   return { m3u, apiData: { categories, streams } };
 }
@@ -363,13 +334,13 @@ export async function onRequest(context: any) {
   const { request, env } = context;
   const url = new URL(request.url);
   const path = url.pathname;
-  const kv = env.IPTV_KV;
 
-  // ★ 调试：确认 KV 绑定
-  console.log(`[onRequest] 路径: ${path}`);
-  console.log(`[onRequest] env.IPTV_KV 是否存在: ${!!kv}`);
+  // ★ 核心修复：EdgeOne Makers 的 KV 绑定通过全局变量访问
+  // 优先用全局变量 IPTV_KV，兜底用 env.IPTV_KV
+  const kv = (typeof IPTV_KV !== 'undefined') ? IPTV_KV : env.IPTV_KV;
+
   if (!kv) {
-    return new Response("ERROR: IPTV_KV 未绑定到环境变量", { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    return new Response("ERROR: IPTV_KV 未绑定，请在控制台绑定 KV 命名空间，变量名填 IPTV_KV", { status: 500 });
   }
 
   // IP限流
@@ -379,9 +350,7 @@ export async function onRequest(context: any) {
     const attempts = await kv.get(rateKey);
     if (attempts && parseInt(attempts) > RATE_LIMIT) return new Response("Rate limited", { status: 429 });
     await kv.put(rateKey, String((parseInt(attempts || "0") + 1)), { expirationTtl: 60 });
-  } catch (e) {
-    console.error(`[onRequest] 限流检查失败: ${e.message}`);
-  }
+  } catch {}
 
   if (path === "/" || path === "/index.html") {
     return new Response(HTML_HOME, { headers: { "Content-Type": "text/html; charset=utf-8" } });
@@ -392,7 +361,7 @@ export async function onRequest(context: any) {
     try {
       const cached = await kv.get(EPG_CACHE_KEY, "text");
       if (cached) return new Response(cached, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
-    } catch (e) { console.error(`[epg.xml] 读取缓存失败: ${e.message}`); }
+    } catch {}
     const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
     const epgUrl = epgList[0];
     if (!epgUrl) return new Response("<!-- No EPG -->", { headers: { "Content-Type": "application/xml" } });
@@ -403,10 +372,10 @@ export async function onRequest(context: any) {
       clearTimeout(timeoutId);
       if (r.ok) {
         const xmlText = await r.text();
-        try { await kv.put(EPG_CACHE_KEY, xmlText, { expirationTtl: EPG_CACHE_TTL / 1000 }); } catch (e) { console.error(`[epg.xml] 写入缓存失败: ${e.message}`); }
+        try { await kv.put(EPG_CACHE_KEY, xmlText, { expirationTtl: EPG_CACHE_TTL / 1000 }); } catch {}
         return new Response(xmlText, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
       }
-    } catch (e) { console.error(`[epg.xml] 抓取失败: ${e.message}`); }
+    } catch {}
     return new Response("<!-- EPG fetch failed -->", { headers: { "Content-Type": "application/xml" } });
   }
 
@@ -422,7 +391,7 @@ export async function onRequest(context: any) {
         bl.push(badUrl);
         await kv.put(BLACKLIST_KEY, JSON.stringify(bl), { expirationTtl: 30 * 24 * 60 * 60 });
       }
-    } catch (e) { console.error(`[report] 写入失败: ${e.message}`); }
+    } catch {}
     return new Response("Reported", { status: 200 });
   }
 
@@ -430,7 +399,7 @@ export async function onRequest(context: any) {
   if (path === "/player_api.php") {
     const action = url.searchParams.get("action");
     let cached: any = null;
-    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch (e) { console.error(`[player_api] 读取缓存失败: ${e.message}`); }
+    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
     if (!cached) return new Response(JSON.stringify({}), { headers: { "Content-Type": "application/json" } });
 
     if (action === "get_live_categories") {
@@ -452,7 +421,7 @@ export async function onRequest(context: any) {
     if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
     const groupName = decodeURIComponent(groupMatch[1]);
     let cached: any = null;
-    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch (e) { console.error(`[group] 读取缓存失败: ${e.message}`); }
+    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
     if (!cached) return new Response("Not cached", { status: 404 });
     const output = filterM3U(cached.m3u, groupName);
     return new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
@@ -476,7 +445,7 @@ export async function onRequest(context: any) {
     }
 
     let cached: any = null;
-    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch (e) { console.error(`[iptv.m3u] 读取缓存失败: ${e.message}`); }
+    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
 
     const now = Date.now();
     const isFresh = cached && (now - (cached.updated_at || 0)) < CACHE_TTL;
@@ -490,32 +459,23 @@ export async function onRequest(context: any) {
     if (cached) {
       const response = new Response(cached.m3u, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
       fetchAndBuild(sources, chanAlias, kv).then(result => {
-        kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() })).catch((e: any) => console.error(`[iptv.m3u] 后台刷新写入失败: ${e.message}`));
-      }).catch((e: any) => console.error(`[iptv.m3u] 后台刷新失败: ${e.message}`));
+        kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() })).catch(() => {});
+      }).catch(() => {});
       return response;
     }
 
     const result = await fetchAndBuild(sources, chanAlias, kv);
-    try { await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: now })); } catch (e) { console.error(`[iptv.m3u] 首次写入失败: ${e.message}`); }
+    try { await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: now })); } catch {}
     let output = result.m3u;
     if (filter) output = filterM3U(output, filter);
     return new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
   }
 
-  // ★ /refresh 路由 —— 去掉静默 catch，错误直接暴露
   if (path === "/refresh") {
     const key = url.searchParams.get("key");
     if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
 
-    console.log(`[refresh] 开始执行，AUTH_KEY 校验通过`);
-
     const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
-    if (sources.length === 0) {
-      console.error(`[refresh] SOURCES 环境变量为空`);
-      return new Response("ERROR: SOURCES 环境变量未配置", { status: 500 });
-    }
-    console.log(`[refresh] 源数量: ${sources.length}`);
-
     const chanAlias = new Map<string, string>();
     const aliasStr = env.CHAN_ALIAS || "";
     if (aliasStr) {
@@ -525,34 +485,14 @@ export async function onRequest(context: any) {
       });
     }
 
-    try {
-      const result = await fetchAndBuild(sources, chanAlias, kv);
-      console.log(`[refresh] fetchAndBuild 完成，m3u 长度: ${result.m3u.length}`);
-
-      if (!result.m3u || result.m3u.length < 50) {
-        console.error(`[refresh] m3u 内容异常短，可能源站全部抓取失败`);
-        return new Response(`WARNING: m3u 内容异常短 (${result.m3u.length} bytes)，源站可能全部不可达`, { status: 500 });
-      }
-
-      await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() }));
-      console.log(`[refresh] KV 写入成功`);
-
-      return new Response(`Refreshed OK! m3u长度=${result.m3u.length}, 流数量=${result.apiData.streams.length}`, { status: 200 });
-    } catch (e: any) {
-      console.error(`[refresh] 执行失败: ${e.message}\n${e.stack}`);
-      return new Response(`Refresh FAILED: ${e.message}`, { status: 500 });
-    }
+    const result = await fetchAndBuild(sources, chanAlias, kv);
+    try { await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() })); } catch {}
+    return new Response("Refreshed", { status: 200 });
   }
 
   if (path === "/status") {
     let cached: any = null;
-    try {
-      const raw = await kv.get(CACHE_KEY, "json");
-      if (raw) cached = raw;
-    } catch (e: any) {
-      return new Response(JSON.stringify({ error: `KV 读取失败: ${e.message}` }), { status: 500, headers: { "Content-Type": "application/json" } });
-    }
-
+    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
     const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
     const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
 
