@@ -4,5 +4,8 @@
     "output": ".",
     "nodeVersion": "20.18.0"
   },
-  "runtime": "edge"
+  "runtime": "edge",
+  "kv": {
+    "IPTV_KV": ""
+  }
 }
