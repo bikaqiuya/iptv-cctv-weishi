@@ -1,11 +1,14 @@
 // ========== 配置 ==========
-const CACHE_VERSION = "v4";
+const CACHE_VERSION = "v5";
 const CACHE_KEY = `iptv_data_${CACHE_VERSION}`;
 const EPG_CACHE_KEY = "epg_xml_data";
-const CACHE_TTL = 12 * 60 * 60 * 1000;       // 12小时
-const EPG_CACHE_TTL = 6 * 60 * 60 * 1000;    // EPG缓存6小时
+const BLACKLIST_KEY = "url_blacklist";
+const CACHE_TTL = 12 * 60 * 60 * 1000;
+const EPG_CACHE_TTL = 6 * 60 * 60 * 1000;
 const FETCH_TIMEOUT = 8000;
 const RATE_LIMIT = 20;
+
+const ORDERED_GROUPS = ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "互联网动漫", "互联网电影", "互联网电视剧"];
 
 // ========== 工具函数 ==========
 
@@ -33,41 +36,25 @@ function normalizeSatellite(name: string): string | null {
 function matchExtraCategories(name: string): string[] {
   const n = name.toLowerCase();
   const categories: string[] = [];
-
   if (/少儿|儿童|kids/.test(n)) categories.push("少儿");
   if (/音乐|music/.test(n)) categories.push("音乐");
   if (/动漫|动画|卡通|anime|comic/.test(n)) categories.push("动漫");
   if (/戏曲|京剧|越剧|黄梅戏|豫剧|昆曲|梨园/.test(n)) categories.push("戏曲");
   if (/纪录|纪录片|纪实|动物世界|人与自然|探索频道|discovery|国家地理|nat\s*geo|national\s*geographic/.test(n)) categories.push("纪录片");
   if (/hd|2k|4k|高清|超清|高画质|fhd|uhd|蓝光|blu-ray/.test(n)) categories.push("高清");
-
   return categories;
 }
 
 function matchInternetCategory(name: string): string | null {
   const n = name.toLowerCase();
-
   if (/频道|电视台|tv$|radio/i.test(n)) return null;
-
   if (/第.{1,4}集|集$|连载|更新至|ep\d+|s\d+e\d+|season|剧集/.test(n)) {
-    if (/动漫|动画|卡通|anime|comic|番|二次元|漫画/.test(n)) {
-      return "互联网动漫";
-    }
+    if (/动漫|动画|卡通|anime|comic|番|二次元|漫画/.test(n)) return "互联网动漫";
     return "互联网电视剧";
   }
-
-  if (/动漫|动画|卡通|anime|comic|番|二次元|漫画/.test(n)) {
-    return "互联网动漫";
-  }
-
-  if (/电影|影院|剧场版|film|movie|cinema/.test(n)) {
-    return "互联网电影";
-  }
-
-  if (/^[\u4e00-\u9fa5]{2,15}$/.test(name)) {
-    return "互联网电影";
-  }
-
+  if (/动漫|动画|卡通|anime|comic|番|二次元|漫画/.test(n)) return "互联网动漫";
+  if (/电影|影院|剧场版|film|movie|cinema/.test(n)) return "互联网电影";
+  if (/^[\u4e00-\u9fa5]{2,15}$/.test(name)) return "互联网电影";
   return null;
 }
 
@@ -79,19 +66,12 @@ function getMainGroup(name: string): { keep: boolean; std: string; group: string
   return { keep: false, std: "", group: "" };
 }
 
-// ★ 完整台标：所有频道都尝试从 fanmingming CDN 获取
+// ★ 完整台标
 function getLogo(chanName: string): string {
-  // 央视
   const cctvMatch = chanName.match(/^CCTV-(\d+)/);
-  if (cctvMatch) {
-    return `https://live.fanmingming.cn/tv/CCTV-${cctvMatch[1]}.png`;
-  }
-  // 卫视
+  if (cctvMatch) return `https://live.fanmingming.cn/tv/CCTV-${cctvMatch[1]}.png`;
   const satMatch = chanName.match(/^([\u4e00-\u9fa5]{2,4})卫视/);
-  if (satMatch) {
-    return `https://live.fanmingming.cn/tv/${satMatch[1]}卫视.png`;
-  }
-  // 其他频道：直接用频道名
+  if (satMatch) return `https://live.fanmingming.cn/tv/${satMatch[1]}卫视.png`;
   return `https://live.fanmingming.cn/tv/${chanName}.png`;
 }
 
@@ -100,17 +80,27 @@ function isValidUrl(url: string): boolean {
   if (!url || !url.trim()) return false;
   try {
     const u = new URL(url.trim());
-    // 只允许 http/https
     if (u.protocol !== "http:" && u.protocol !== "https:") return false;
-    // 剔除本地回环
     const hostname = u.hostname.toLowerCase();
     if (hostname === "localhost" || hostname === "0.0.0.0" || hostname === "127.0.0.1" || hostname === "::1") return false;
-    // 剔除内网地址
     if (hostname.startsWith("192.168.") || hostname.startsWith("10.") || hostname.match(/^172\.(1[6-9]|2[0-9]|3[01])\./)) return false;
     return true;
-  } catch {
-    return false;
+  } catch { return false; }
+}
+
+// ★ 频道名标签提取
+function extractTags(name: string): { cleanName: string; tags: string[]; isHighDef: boolean } {
+  const tagPattern = /\[([^\]]+)\]|\((4K|1080P|720P|HEVC|H265|H264|高清|超清|蓝光|HD|SD|UHD|FHD|HDR|杜比|DOLBY)\)/gi;
+  const tags: string[] = [];
+  let match;
+  while ((match = tagPattern.exec(name)) !== null) {
+    const tag = (match[1] || match[2] || match[0]).toUpperCase();
+    tags.push(tag);
   }
+  const cleanName = name.replace(tagPattern, "").replace(/\s+/g, " ").trim();
+  const highDefTags = ["4K", "1080P", "HEVC", "H265", "高清", "超清", "蓝光", "HD", "UHD", "FHD", "HDR"];
+  const isHighDef = tags.some(t => highDefTags.includes(t));
+  return { cleanName, tags, isHighDef };
 }
 
 function filterM3U(m3u: string, filter: string): string {
@@ -118,27 +108,29 @@ function filterM3U(m3u: string, filter: string): string {
   const filtered: string[] = [];
   let keep = false;
   for (const line of lines) {
-    if (line.startsWith("#EXTM3U")) {
-      filtered.push(line);
-      continue;
-    }
+    if (line.startsWith("#EXTM3U")) { filtered.push(line); continue; }
     if (line.startsWith("#EXTINF")) {
       keep = line.includes(`group-title="${filter}"`);
       if (keep) filtered.push(line);
       continue;
     }
-    if (keep && line.trim()) {
-      filtered.push(line);
-      keep = false;
-    }
+    if (keep && line.trim()) { filtered.push(line); keep = false; }
   }
   return filtered.join("\n");
 }
 
 // ========== 拉取源 + 聚合 ==========
 
-async function fetchAndBuild(sources: string[], epgUrl: string, chanAlias: Map<string, string>): Promise<string> {
+async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, kv: any): Promise<{ m3u: string; apiData: any }> {
+  // 加载黑名单
+  let blacklist: Set<string> = new Set();
+  try {
+    const bl = await kv.get(BLACKLIST_KEY, "json");
+    if (bl && Array.isArray(bl)) blacklist = new Set(bl);
+  } catch {}
+
   const groups: Record<string, Record<string, Set<string>>> = {};
+  const chanMeta: Record<string, { tvgId?: string; tvgLogo?: string; tvgShift?: string }> = {};
 
   function addToGroup(group: string, stdName: string, url: string) {
     if (!groups[group]) groups[group] = {};
@@ -151,15 +143,10 @@ async function fetchAndBuild(sources: string[], epgUrl: string, chanAlias: Map<s
       try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
-        const r = await fetch(url, {
-          signal: controller.signal,
-          headers: { "User-Agent": "Mozilla/5.0" }
-        });
+        const r = await fetch(url, { signal: controller.signal, headers: { "User-Agent": "Mozilla/5.0" } });
         clearTimeout(timeoutId);
         return r.ok ? await r.text() : "";
-      } catch {
-        return "";
-      }
+      } catch { return ""; }
     })
   );
 
@@ -168,6 +155,10 @@ async function fetchAndBuild(sources: string[], epgUrl: string, chanAlias: Map<s
     const lines = text.split(/\r?\n/);
     let curName = "";
     let curGroupFromSrc = "";
+    let curTvgId = "";
+    let curTvgLogo = "";
+    let curTvgShift = "";
+
     for (const line of lines) {
       const trimmed = line.trim();
       if (trimmed.startsWith("#EXTINF")) {
@@ -175,17 +166,36 @@ async function fetchAndBuild(sources: string[], epgUrl: string, chanAlias: Map<s
         curName = commaIdx >= 0 ? trimmed.substring(commaIdx + 1).trim() : "";
         const grpMatch = trimmed.match(/group-title="([^"]*)"/i);
         curGroupFromSrc = grpMatch ? grpMatch[1] : "";
+
+        // ★ 元数据继承：提取源自带的 tvg 属性
+        const idMatch = trimmed.match(/tvg-id="([^"]*)"/i);
+        const logoMatch = trimmed.match(/tvg-logo="([^"]*)"/i);
+        const shiftMatch = trimmed.match(/tvg-shift="([^"]*)"/i);
+        curTvgId = idMatch ? idMatch[1] : "";
+        curTvgLogo = logoMatch ? logoMatch[1] : "";
+        curTvgShift = shiftMatch ? shiftMatch[1] : "";
         continue;
       }
       if (trimmed && !trimmed.startsWith("#") && curName) {
-        // ★ 自动剔除无效 URL
-        if (!isValidUrl(trimmed)) {
-          curName = "";
-          continue;
-        }
+        // ★ 黑名单过滤
+        if (blacklist.has(trimmed)) { curName = ""; continue; }
+        // 无效 URL 过滤
+        if (!isValidUrl(trimmed)) { curName = ""; continue; }
 
         // ★ 频道名模糊映射
         let finalName = chanAlias.get(curName) || curName;
+
+        // ★ 标签提取 & 清理
+        const { cleanName, isHighDef } = extractTags(finalName);
+        finalName = cleanName;
+
+        // 保存元数据
+        if (curTvgId || curTvgLogo || curTvgShift) {
+          if (!chanMeta[finalName]) chanMeta[finalName] = {};
+          if (curTvgId) chanMeta[finalName].tvgId = curTvgId;
+          if (curTvgLogo && isValidUrl(curTvgLogo)) chanMeta[finalName].tvgLogo = curTvgLogo;
+          if (curTvgShift) chanMeta[finalName].tvgShift = curTvgShift;
+        }
 
         const main = getMainGroup(finalName);
         const groupHint = /央视|CCTV/i.test(curGroupFromSrc) ? "央视" :
@@ -201,42 +211,33 @@ async function fetchAndBuild(sources: string[], epgUrl: string, chanAlias: Map<s
           assignedMain = groupHint;
         }
 
+        // 标签辅助分组：明确带高清标签的归入高清
+        if (!assignedMain && isHighDef) assignedMain = "高清";
+
         if (assignedMain) {
           addToGroup(assignedMain, stdName, trimmed);
           const extras = matchExtraCategories(stdName);
-          for (const cat of extras) {
-            addToGroup(cat, stdName, trimmed);
-          }
+          for (const cat of extras) addToGroup(cat, stdName, trimmed);
         } else {
           const internetCat = matchInternetCategory(finalName);
-          if (internetCat) {
-            addToGroup(internetCat, finalName, trimmed);
-          }
+          if (internetCat) addToGroup(internetCat, finalName, trimmed);
         }
-
         curName = "";
       }
     }
   }
 
-  // 生成 M3U
-  let m3u = "#EXTM3U";
-  // ★ EPG 指向自己的代理接口
-  m3u += ` url-tvg="/epg.xml"`;
-  m3u += "\n";
+  // ===== 生成 M3U =====
+  let m3u = "#EXTM3U\n";
 
-  const orderedGroups = ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "互联网动漫", "互联网电影", "互联网电视剧"];
-
-  // 构建 URL → 首次出现的频道名 映射（跨频道名去重）
+  // URL → 首次出现频道名（跨频道名去重）
   const urlFirstChan = new Map<string, string>();
-  for (const g of orderedGroups) {
+  for (const g of ORDERED_GROUPS) {
     const chanMap = groups[g];
     if (!chanMap) continue;
     for (const chan of Object.keys(chanMap)) {
       for (const url of chanMap[chan]) {
-        if (!urlFirstChan.has(url)) {
-          urlFirstChan.set(url, chan);
-        }
+        if (!urlFirstChan.has(url)) urlFirstChan.set(url, chan);
       }
     }
   }
@@ -247,27 +248,63 @@ async function fetchAndBuild(sources: string[], epgUrl: string, chanAlias: Map<s
     return parseInt(na) - parseInt(nb);
   };
 
-  for (const g of orderedGroups) {
+  for (const g of ORDERED_GROUPS) {
     const chanMap = groups[g];
     if (!chanMap) continue;
     let chanNames = Object.keys(chanMap);
-    if (g === "央视") {
-      chanNames.sort(cctvOrder);
-    } else {
-      chanNames.sort((a, b) => a.localeCompare(b));
-    }
+    if (g === "央视") chanNames.sort(cctvOrder);
+    else chanNames.sort((a, b) => a.localeCompare(b));
+
     for (const chan of chanNames) {
       for (const url of chanMap[chan]) {
         if (urlFirstChan.get(url) !== chan) continue;
 
-        const logo = getLogo(chan);
+        const meta = chanMeta[chan] || {};
+        const logo = meta.tvgLogo || getLogo(chan);
+        const tvgIdAttr = meta.tvgId ? ` tvg-id="${meta.tvgId}"` : "";
+        const tvgShiftAttr = meta.tvgShift ? ` tvg-shift="${meta.tvgShift}"` : "";
         const logoAttr = logo ? ` tvg-logo="${logo}"` : "";
-        m3u += `#EXTINF:-1 tvg-name="${chan}"${logoAttr} group-title="${g}",${chan}\n${url}\n`;
+
+        m3u += `#EXTINF:-1 tvg-name="${chan}"${tvgIdAttr}${tvgShiftAttr}${logoAttr} group-title="${g}",${chan}\n${url}\n`;
       }
     }
   }
 
-  return m3u;
+  // ===== 构建 Xtream Codes API 数据 =====
+  const categories = ORDERED_GROUPS.map((g, i) => ({
+    category_id: i + 1,
+    category_name: g,
+    parent_id: 0
+  }));
+
+  const streams: any[] = [];
+  let streamId = 1;
+  for (const g of ORDERED_GROUPS) {
+    const chanMap = groups[g];
+    if (!chanMap) continue;
+    for (const chan of Object.keys(chanMap)) {
+      for (const url of chanMap[chan]) {
+        if (urlFirstChan.get(url) !== chan) continue;
+        const meta = chanMeta[chan] || {};
+        const logo = meta.tvgLogo || getLogo(chan);
+        streams.push({
+          num: streamId,
+          name: chan,
+          stream_type: "live",
+          stream_id: streamId,
+          stream_icon: logo,
+          epg_channel_id: meta.tvgId || chan,
+          category_id: ORDERED_GROUPS.indexOf(g) + 1,
+          custom_sid: "",
+          tv_archive: 0,
+          direct_source: url
+        });
+        streamId++;
+      }
+    }
+  }
+
+  return { m3u, apiData: { categories, streams } };
 }
 
 // ========== 伪装主页 ==========
@@ -318,9 +355,7 @@ export async function onRequest(context: any) {
   const rateKey = `rate_${ip}`;
   try {
     const attempts = await kv.get(rateKey);
-    if (attempts && parseInt(attempts) > RATE_LIMIT) {
-      return new Response("Rate limited", { status: 429 });
-    }
+    if (attempts && parseInt(attempts) > RATE_LIMIT) return new Response("Rate limited", { status: 429 });
     await kv.put(rateKey, String((parseInt(attempts || "0") + 1)), { expirationTtl: 60 });
   } catch {}
 
@@ -328,88 +363,119 @@ export async function onRequest(context: any) {
     return new Response(HTML_HOME, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
-  // ★ EPG 代理接口（不需要鉴权，播放器自动请求）
+  // ★ EPG 代理
   if (path === "/epg.xml") {
-    // 尝试从缓存读取
     try {
       const cached = await kv.get(EPG_CACHE_KEY, "text");
-      if (cached) {
-        return new Response(cached, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
-      }
+      if (cached) return new Response(cached, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
     } catch {}
-
-    // 从环境变量拉取
     const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
     const epgUrl = epgList[0];
-    if (!epgUrl) {
-      return new Response("<!-- No EPG configured -->", { headers: { "Content-Type": "application/xml" } });
-    }
-
+    if (!epgUrl) return new Response("<!-- No EPG -->", { headers: { "Content-Type": "application/xml" } });
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 15000);
-      const r = await fetch(epgUrl, {
-        signal: controller.signal,
-        headers: { "User-Agent": "Mozilla/5.0" }
-      });
+      const r = await fetch(epgUrl, { signal: controller.signal, headers: { "User-Agent": "Mozilla/5.0" } });
       clearTimeout(timeoutId);
       if (r.ok) {
         const xmlText = await r.text();
-        // 缓存到 KV
         try { await kv.put(EPG_CACHE_KEY, xmlText, { expirationTtl: EPG_CACHE_TTL / 1000 }); } catch {}
         return new Response(xmlText, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
       }
     } catch {}
-
     return new Response("<!-- EPG fetch failed -->", { headers: { "Content-Type": "application/xml" } });
+  }
+
+  // ★ 坏链上报
+  if (path === "/report") {
+    const key = url.searchParams.get("key");
+    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
+    const badUrl = url.searchParams.get("url");
+    if (!badUrl || !isValidUrl(badUrl)) return new Response("Invalid URL", { status: 400 });
+    try {
+      let bl: string[] = await kv.get(BLACKLIST_KEY, "json") || [];
+      if (!bl.includes(badUrl)) {
+        bl.push(badUrl);
+        await kv.put(BLACKLIST_KEY, JSON.stringify(bl), { expirationTtl: 30 * 24 * 60 * 60 }); // 30天
+      }
+    } catch {}
+    return new Response("Reported", { status: 200 });
+  }
+
+  // ★ Xtream Codes API 兼容
+  if (path === "/player_api.php") {
+    const action = url.searchParams.get("action");
+    let cached: any = null;
+    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
+    if (!cached) return new Response(JSON.stringify({}), { headers: { "Content-Type": "application/json" } });
+
+    if (action === "get_live_categories") {
+      return new Response(JSON.stringify(cached.apiData?.categories || []), { headers: { "Content-Type": "application/json" } });
+    }
+    if (action === "get_live_streams") {
+      const catId = parseInt(url.searchParams.get("category_id") || "0");
+      const streams = cached.apiData?.streams || [];
+      if (catId > 0) return new Response(JSON.stringify(streams.filter((s: any) => s.category_id === catId)), { headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify(streams), { headers: { "Content-Type": "application/json" } });
+    }
+    // 默认返回用户信息（模拟）
+    return new Response(JSON.stringify({ user_info: { auth: 1, status: "Active" } }), { headers: { "Content-Type": "application/json" } });
+  }
+
+  // ★ 按分组独立 M3U
+  const groupMatch = path.match(/^\/group\/(.+)\.m3u$/);
+  if (groupMatch) {
+    const key = url.searchParams.get("key");
+    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
+    const groupName = decodeURIComponent(groupMatch[1]);
+    let cached: any = null;
+    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
+    if (!cached) return new Response("Not cached", { status: 404 });
+    const output = filterM3U(cached.m3u, groupName);
+    return new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
   }
 
   if (path === "/iptv.m3u") {
     const key = url.searchParams.get("key");
-    const authKey = env.AUTH_KEY;
-    if (!authKey || key !== authKey) return new Response("Unauthorized", { status: 403 });
+    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
 
     const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
     if (sources.length === 0) return new Response("SOURCES not configured", { status: 500 });
 
     const filter = url.searchParams.get("filter");
-
-    // ★ 解析频道名模糊映射
     const chanAlias = new Map<string, string>();
     const aliasStr = env.CHAN_ALIAS || "";
     if (aliasStr) {
-      aliasStr.split(",").forEach(pair => {
+      aliasStr.split(",").forEach((pair: string) => {
         const [from, to] = pair.split("=").map(s => s.trim());
         if (from && to) chanAlias.set(from, to);
       });
     }
 
-    let cached: { m3u: string; updated_at: number } | null = null;
-    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw as any; } catch {}
+    let cached: any = null;
+    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
 
     const now = Date.now();
+    const isFresh = cached && (now - (cached.updated_at || 0)) < CACHE_TTL;
 
-    if (cached && (now - cached.updated_at) < CACHE_TTL) {
+    if (isFresh) {
       let output = cached.m3u;
       if (filter) output = filterM3U(output, filter);
       return new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
     }
 
-    if (cached && (now - cached.updated_at) >= CACHE_TTL) {
-      let output = cached.m3u;
-      if (filter) output = filterM3U(output, filter);
-      const response = new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
-
-      fetchAndBuild(sources, "", chanAlias).then(m3u => {
-        kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: Date.now() })).catch(() => {});
+    if (cached) {
+      // Stale-While-Revalidate
+      const response = new Response(cached.m3u, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
+      fetchAndBuild(sources, chanAlias, kv).then(result => {
+        kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() })).catch(() => {});
       }).catch(() => {});
-
       return response;
     }
 
-    const m3u = await fetchAndBuild(sources, "", chanAlias);
-    try { await kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: now })); } catch {}
-    let output = m3u;
+    const result = await fetchAndBuild(sources, chanAlias, kv);
+    try { await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: now })); } catch {}
+    let output = result.m3u;
     if (filter) output = filterM3U(output, filter);
     return new Response(output, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
   }
@@ -417,25 +483,23 @@ export async function onRequest(context: any) {
   if (path === "/refresh") {
     const key = url.searchParams.get("key");
     if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
-
     const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
     const chanAlias = new Map<string, string>();
     const aliasStr = env.CHAN_ALIAS || "";
     if (aliasStr) {
-      aliasStr.split(",").forEach(pair => {
+      aliasStr.split(",").forEach((pair: string) => {
         const [from, to] = pair.split("=").map(s => s.trim());
         if (from && to) chanAlias.set(from, to);
       });
     }
-
-    const m3u = await fetchAndBuild(sources, "", chanAlias);
-    try { await kv.put(CACHE_KEY, JSON.stringify({ m3u, updated_at: Date.now() })); } catch {}
+    const result = await fetchAndBuild(sources, chanAlias, kv);
+    try { await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() })); } catch {}
     return new Response("Refreshed", { status: 200 });
   }
 
   if (path === "/status") {
-    let cached: { m3u: string; updated_at: number } | null = null;
-    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw as any; } catch {}
+    let cached: any = null;
+    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
     const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
     const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
 
@@ -447,12 +511,17 @@ export async function onRequest(context: any) {
       sources_count: sources.length,
       epg_sources: epgList,
       epg_proxy: "/epg.xml",
-      groups: ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "互联网动漫", "互联网电影", "互联网电视剧"]
+      blacklist_count: cached ? (cached.blacklist_count || 0) : 0,
+      groups: ORDERED_GROUPS,
+      endpoints: {
+        m3u: "/iptv.m3u?key=xxx",
+        group: "/group/央视.m3u?key=xxx",
+        xtream_api: "/player_api.php?action=get_live_categories",
+        report: "/report?key=xxx&url=xxx",
+        epg: "/epg.xml"
+      }
     };
-
-    return new Response(JSON.stringify(status, null, 2), {
-      headers: { "Content-Type": "application/json; charset=utf-8" }
-    });
+    return new Response(JSON.stringify(status, null, 2), { headers: { "Content-Type": "application/json; charset=utf-8" } });
   }
 
   return new Response("Not Found", { status: 404 });
