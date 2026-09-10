@@ -1,6 +1,6 @@
 // edge-functions/[[default]].ts
 // ========== 配置 ==========
-const CACHE_VERSION = "v6";
+const CACHE_VERSION = "v7"; // ★ 版本号+1，强制刷新缓存
 const CACHE_KEY = `iptv_data_${CACHE_VERSION}`;
 const EPG_CACHE_KEY = "epg_xml_data";
 const BLACKLIST_KEY = "url_blacklist";
@@ -9,7 +9,8 @@ const EPG_CACHE_TTL = 6 * 60 * 60 * 1000;
 const FETCH_TIMEOUT = 12000;
 const RATE_LIMIT = 20;
 
-const ORDERED_GROUPS = ["央视", "卫视", "高清", "少儿", "音乐", "动漫", "戏曲", "纪录片", "体育", "电影", "新闻", "互联网动漫", "互联网电影", "互联网电视剧"];
+// ★ 高清排在最前，然后是央视、卫视
+const ORDERED_GROUPS = ["高清", "央视", "卫视", "少儿", "音乐", "动漫", "戏曲", "纪录片", "体育", "电影", "新闻", "互联网动漫", "互联网电影", "互联网电视剧"];
 
 // ========== 工具函数 ==========
 
@@ -122,7 +123,7 @@ function filterM3U(m3u: string, filter: string): string {
   return filtered.join("\n");
 }
 
-// ========== 带超时的 fetch（用 Promise.race 替代 setTimeout） ==========
+// ========== 带超时的 fetch ==========
 async function fetchWithTimeout(url: string, timeoutMs: number): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -197,15 +198,22 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
           if (curTvgShift) chanMeta[finalName].tvgShift = curTvgShift;
         }
 
+        // ★★★ 分组优选逻辑（核心修改） ★★★
         let assignedGroup = "";
         const cctvMatch = finalName.match(/^CCTV-\d+/);
         const satMatch = finalName.match(/^[\u4e00-\u9fa5]{2,4}卫视/);
 
-        if (cctvMatch) {
+        if (isHighDef && (cctvMatch || satMatch)) {
+          // 第一优先：央视高清、卫视高清 → 归入「高清」
+          assignedGroup = "高清";
+        } else if (cctvMatch) {
+          // 第二优先：普通央视 → 归入「央视」
           assignedGroup = "央视";
         } else if (satMatch) {
+          // 第三优先：普通卫视 → 归入「卫视」
           assignedGroup = "卫视";
         } else {
+          // 其他情况
           const internetCat = matchInternetCategory(finalName);
           if (internetCat && ORDERED_GROUPS.includes(internetCat)) {
             assignedGroup = internetCat;
@@ -214,18 +222,23 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
           }
         }
 
+        // 无法归入白名单主分组 → 直接丢弃
         if (!assignedGroup || !ORDERED_GROUPS.includes(assignedGroup)) {
           curName = "";
           continue;
         }
 
+        // 写入主分组
         addToGroup(assignedGroup, finalName, trimmed);
+
+        // 额外分类匹配（对所有已保留频道生效）
         const extras = matchExtraCategories(finalName);
         for (const cat of extras) {
           if (ORDERED_GROUPS.includes(cat)) {
             addToGroup(cat, finalName, trimmed);
           }
         }
+
         curName = "";
       }
     }
@@ -317,16 +330,13 @@ export async function onRequest(context: any) {
     await kv.put(rateKey, String((parseInt(attempts || "0") + 1)), { expirationTtl: 60 });
   } catch {}
 
-  // ---- /refresh ----
   if (path === "/refresh") {
     try {
       const key = url.searchParams.get("key");
       if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
 
       const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
-      if (sources.length === 0) {
-        return new Response("ERROR: SOURCES 环境变量未配置或为空", { status: 500 });
-      }
+      if (sources.length === 0) return new Response("ERROR: SOURCES 未配置", { status: 500 });
 
       const chanAlias = new Map<string, string>();
       const aliasStr = env.CHAN_ALIAS || "";
@@ -341,12 +351,10 @@ export async function onRequest(context: any) {
       await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() }));
       return new Response("Refreshed OK", { status: 200 });
     } catch (err: any) {
-      // ★ 关键：捕获并返回具体错误，方便排查
       return new Response(`Refresh Error: ${err.message || err}`, { status: 500 });
     }
   }
 
-  // ---- /status ----
   if (path === "/status") {
     try {
       let cached: any = null;
@@ -365,7 +373,6 @@ export async function onRequest(context: any) {
     }
   }
 
-  // ---- /iptv.m3u ----
   if (path === "/iptv.m3u") {
     const key = url.searchParams.get("key");
     if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
@@ -401,7 +408,6 @@ export async function onRequest(context: any) {
     return new Response(result.m3u, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
   }
 
-  // ---- /epg.xml ----
   if (path === "/epg.xml") {
     try {
       const cached = await kv.get(EPG_CACHE_KEY, "text");
@@ -424,7 +430,6 @@ export async function onRequest(context: any) {
     return new Response("<!-- EPG fetch failed -->", { headers: { "Content-Type": "application/xml" } });
   }
 
-  // ---- /report ----
   if (path === "/report") {
     const key = url.searchParams.get("key");
     if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
@@ -437,7 +442,6 @@ export async function onRequest(context: any) {
     return new Response("Reported", { status: 200 });
   }
 
-  // ---- /player_api.php ----
   if (path === "/player_api.php") {
     const action = url.searchParams.get("action");
     let cached: any = null;
@@ -453,7 +457,6 @@ export async function onRequest(context: any) {
     return new Response(JSON.stringify({ user_info: { auth: 1, status: "Active" } }), { headers: { "Content-Type": "application/json" } });
   }
 
-  // ---- /group/*.m3u ----
   const groupMatch = path.match(/^\/group\/(.+)\.m3u$/);
   if (groupMatch) {
     const key = url.searchParams.get("key");
@@ -465,40 +468,13 @@ export async function onRequest(context: any) {
     return new Response(filterM3U(cached.m3u, groupName), { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" } });
   }
 
-  // ---- 首页 ----
   if (path === "/" || path === "/index.html") {
     return new Response(`<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <title>湿地生态保护中心</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #e8f5e9; color: #1b5e20; margin: 0; padding: 40px; }
-    .container { max-width: 800px; margin: 0 auto; text-align: center; }
-    h1 { font-size: 2.5em; margin-bottom: 0.5em; color: #2e7d32; }
-    p { color: #388e3c; line-height: 1.8; }
-    .card { background: #c8e6c9; border-radius: 12px; padding: 30px; margin-top: 30px; border-left: 5px solid #4caf50; text-align: left; }
-    .card ul { padding-left: 20px; } .card li { margin-bottom: 10px; }
-    .footer { margin-top: 40px; font-size: 0.85em; color: #689f38; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>🌿 湿地生态保护中心</h1>
-    <div class="card">
-      <p>湿地被誉为<strong>"地球之肾"</strong>，是生物多样性最丰富的生态系统之一，也是候鸟迁徙的重要驿站。</p>
-      <ul>
-        <li>🌱 保护和恢复湿地植被，维护水陆交错带的生态平衡</li>
-        <li>🦅 守护珍稀候鸟栖息地，保障迁徙通道安全</li>
-        <li>💧 净化水质、蓄洪防旱，发挥湿地生态服务功能</li>
-        <li>🔬 开展湿地科普教育，提升公众环保意识</li>
-      </ul>
-      <p>每一片湿地都是生命的摇篮。让我们携手行动，减少污染、保护生境，为子孙后代留下碧水蓝天、鸟语花香的美丽家园。</p>
-    </div>
-    <div class="footer">© 2026 湿地生态保护项目 | 共建人与自然和谐共生的美丽中国</div>
-  </div>
-</body>
-</html>`, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+<html lang="zh-CN"><head><meta charset="UTF-8"><title>湿地生态保护中心</title></head>
+<body style="font-family:sans-serif;background:#e8f5e9;color:#1b5e20;padding:40px;">
+  <h1>🌿 湿地生态保护中心</h1>
+  <p>每一片湿地都是生命的摇篮。</p>
+</body></html>`, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
   return new Response("Not Found", { status: 404 });
