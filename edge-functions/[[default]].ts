@@ -19,6 +19,13 @@ const ORDERED_GROUPS = [
   "互联网动漫", "互联网电影", "互联网电视剧"
 ];
 
+// ========== 通用 CORS Headers ==========
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
+  "Access-Control-Allow-Headers": "*"
+};
+
 // ========== 工具函数 ==========
 
 function normalizeCCTV(name: string): string | null {
@@ -326,15 +333,23 @@ export async function onRequest(context: any) {
   const url = new URL(request.url);
   const path = url.pathname;
 
+  // 0. 处理 CORS 跨域预检 (OPTIONS 请求)
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: CORS_HEADERS
+    });
+  }
+
   const kv = getKV(env);
-  if (!kv) return new Response("ERROR: IPTV_KV 未绑定", { status: 500 });
+  if (!kv) return new Response("ERROR: IPTV_KV 未绑定", { status: 500, headers: CORS_HEADERS });
 
   // 限流策略
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const rateKey = `rate_${ip}`;
   try {
     const attempts = await kv.get(rateKey);
-    if (attempts && parseInt(attempts) > RATE_LIMIT) return new Response("Rate limited", { status: 429 });
+    if (attempts && parseInt(attempts) > RATE_LIMIT) return new Response("Rate limited", { status: 429, headers: CORS_HEADERS });
     await kv.put(rateKey, String((parseInt(attempts || "0") + 1)), { expirationTtl: 60 });
   } catch {}
 
@@ -342,10 +357,10 @@ export async function onRequest(context: any) {
   if (path === "/refresh") {
     try {
       const key = url.searchParams.get("key");
-      if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
+      if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403, headers: CORS_HEADERS });
 
       const sources = (env.SOURCES || "").split(",").map((s: string) => s.trim()).filter(Boolean);
-      if (sources.length === 0) return new Response("ERROR: SOURCES 未配置", { status: 500 });
+      if (sources.length === 0) return new Response("ERROR: SOURCES 未配置", { status: 500, headers: CORS_HEADERS });
 
       const chanAlias = new Map<string, string>();
       const aliasStr = env.CHAN_ALIAS || "";
@@ -358,9 +373,9 @@ export async function onRequest(context: any) {
 
       const result = await fetchAndBuild(sources, chanAlias, kv);
       await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() }));
-      return new Response("Refreshed OK", { status: 200 });
+      return new Response("Refreshed OK", { status: 200, headers: CORS_HEADERS });
     } catch (err: any) {
-      return new Response(`Refresh Error: ${err.message || err}`, { status: 500 });
+      return new Response(`Refresh Error: ${err.message || err}`, { status: 500, headers: CORS_HEADERS });
     }
   }
 
@@ -381,18 +396,23 @@ export async function onRequest(context: any) {
         age_minutes: cached ? Math.floor((Date.now() - cached.updated_at) / 60000) : null,
         sources_count: sources.length, epg_sources: epgList, epg_proxy: "/epg.xml",
         groups: ORDERED_GROUPS,
-      }, null, 2), { headers: { "Content-Type": "application/json; charset=utf-8" } });
+      }, null, 2), { 
+        headers: { 
+          ...CORS_HEADERS,
+          "Content-Type": "application/json; charset=utf-8" 
+        } 
+      });
     } catch (err: any) {
-      return new Response(`Status Error: ${err.message}`, { status: 500 });
+      return new Response(`Status Error: ${err.message}`, { status: 500, headers: CORS_HEADERS });
     }
   }
 
-  // 3. M3U 纯文本订阅导出（避免激活浏览器内建播放插件）
+  // 3. M3U 订阅导出（智能区分浏览器纯文本 / IPTV播放器）
   if (path === "/iptv.m3u") {
     const key = url.searchParams.get("key");
-    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
+    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403, headers: CORS_HEADERS });
     const sources = (env.SOURCES || "").split(",").map((s: string) => s.trim()).filter(Boolean);
-    if (sources.length === 0) return new Response("SOURCES not configured", { status: 500 });
+    if (sources.length === 0) return new Response("SOURCES not configured", { status: 500, headers: CORS_HEADERS });
 
     const chanAlias = new Map<string, string>();
     const aliasStr = env.CHAN_ALIAS || "";
@@ -412,16 +432,22 @@ export async function onRequest(context: any) {
     const now = Date.now();
     const isFresh = cached && (now - (cached.updated_at || 0)) < CACHE_TTL;
 
-    const plainHeaders = {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Content-Disposition": "inline",
+    // 判断 User-Agent：浏览器显示纯文本，IPTV 播放器使用标准 M3U Header
+    const ua = (request.headers.get("User-Agent") || "").toLowerCase();
+    const isBrowser = ua.includes("mozilla") || ua.includes("chrome") || ua.includes("safari");
+    const contentType = isBrowser ? "text/plain; charset=utf-8" : "application/vnd.apple.mpegurl; charset=utf-8";
+
+    const m3uHeaders = {
+      ...CORS_HEADERS,
+      "Content-Type": contentType,
+      "Content-Disposition": "inline; filename=\"iptv.m3u\"",
       "Cache-Control": "no-cache"
     };
 
-    if (isFresh) return new Response(cached.m3u, { headers: plainHeaders });
+    if (isFresh) return new Response(cached.m3u, { headers: m3uHeaders });
 
     if (cached) {
-      const response = new Response(cached.m3u, { headers: plainHeaders });
+      const response = new Response(cached.m3u, { headers: m3uHeaders });
       fetchAndBuild(sources, chanAlias, kv).then(result => {
         kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() })).catch(() => {});
       }).catch(() => {});
@@ -430,18 +456,18 @@ export async function onRequest(context: any) {
 
     const result = await fetchAndBuild(sources, chanAlias, kv);
     try { await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: now })); } catch {}
-    return new Response(result.m3u, { headers: plainHeaders });
+    return new Response(result.m3u, { headers: m3uHeaders });
   }
 
   // 4. EPG 代理
   if (path === "/epg.xml") {
     try {
       const cached = await kv.get(EPG_CACHE_KEY);
-      if (cached) return new Response(cached, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
+      if (cached) return new Response(cached, { headers: { ...CORS_HEADERS, "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
     } catch {}
     const epgList = (env.EPG_URL || "").split(",").map((s: string) => s.trim()).filter(Boolean);
     const epgUrl = epgList[0];
-    if (!epgUrl) return new Response("<!-- No EPG -->", { headers: { "Content-Type": "application/xml" } });
+    if (!epgUrl) return new Response("<!-- No EPG -->", { headers: { ...CORS_HEADERS, "Content-Type": "application/xml" } });
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 25000);
@@ -450,18 +476,18 @@ export async function onRequest(context: any) {
       if (r.ok) {
         const xmlText = await r.text();
         try { await kv.put(EPG_CACHE_KEY, xmlText, { expirationTtl: EPG_CACHE_TTL / 1000 }); } catch {}
-        return new Response(xmlText, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
+        return new Response(xmlText, { headers: { ...CORS_HEADERS, "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
       }
     } catch {}
-    return new Response("<!-- EPG fetch failed -->", { headers: { "Content-Type": "application/xml" } });
+    return new Response("<!-- EPG fetch failed -->", { headers: { ...CORS_HEADERS, "Content-Type": "application/xml" } });
   }
 
   // 5. 黑名单上报
   if (path === "/report") {
     const key = url.searchParams.get("key");
-    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
+    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403, headers: CORS_HEADERS });
     const badUrl = url.searchParams.get("url");
-    if (!badUrl || !isValidUrl(badUrl)) return new Response("Invalid URL", { status: 400 });
+    if (!badUrl || !isValidUrl(badUrl)) return new Response("Invalid URL", { status: 400, headers: CORS_HEADERS });
     try {
       const rawBl = await kv.get(BLACKLIST_KEY);
       let bl: string[] = rawBl ? (typeof rawBl === "string" ? JSON.parse(rawBl) : rawBl) : [];
@@ -470,10 +496,10 @@ export async function onRequest(context: any) {
         await kv.put(BLACKLIST_KEY, JSON.stringify(bl), { expirationTtl: 30 * 24 * 60 * 60 });
       }
     } catch {}
-    return new Response("Reported", { status: 200 });
+    return new Response("Reported", { status: 200, headers: CORS_HEADERS });
   }
 
-  // 6. Player API
+  // 6. Player API (Xtream Codes API 支持)
   if (path === "/player_api.php") {
     const action = url.searchParams.get("action");
     let cached: any = null;
@@ -482,42 +508,50 @@ export async function onRequest(context: any) {
       if (raw) cached = typeof raw === "string" ? JSON.parse(raw) : raw;
     } catch {}
 
-    if (!cached) return new Response(JSON.stringify({}), { headers: { "Content-Type": "application/json" } });
-    if (action === "get_live_categories") return new Response(JSON.stringify(cached.apiData?.categories || []), { headers: { "Content-Type": "application/json" } });
+    const jsonHeaders = { ...CORS_HEADERS, "Content-Type": "application/json; charset=utf-8" };
+
+    if (!cached) return new Response(JSON.stringify({}), { headers: jsonHeaders });
+    if (action === "get_live_categories") return new Response(JSON.stringify(cached.apiData?.categories || []), { headers: jsonHeaders });
     if (action === "get_live_streams") {
       const catId = parseInt(url.searchParams.get("category_id") || "0");
       const streams = cached.apiData?.streams || [];
-      if (catId > 0) return new Response(JSON.stringify(streams.filter((s: any) => s.category_id === catId)), { headers: { "Content-Type": "application/json" } });
-      return new Response(JSON.stringify(streams), { headers: { "Content-Type": "application/json" } });
+      if (catId > 0) return new Response(JSON.stringify(streams.filter((s: any) => s.category_id === catId)), { headers: jsonHeaders });
+      return new Response(JSON.stringify(streams), { headers: jsonHeaders });
     }
-    return new Response(JSON.stringify({ user_info: { auth: 1, status: "Active" } }), { headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ user_info: { auth: 1, status: "Active" } }), { headers: jsonHeaders });
   }
 
   // 7. 分组导出
   const groupMatch = path.match(/^\/group\/(.+)\.m3u$/);
   if (groupMatch) {
     const key = url.searchParams.get("key");
-    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
+    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403, headers: CORS_HEADERS });
     const groupName = decodeURIComponent(groupMatch[1]);
     let cached: any = null;
     try {
       const raw = await kv.get(CACHE_KEY);
       if (raw) cached = typeof raw === "string" ? JSON.parse(raw) : raw;
     } catch {}
-    if (!cached) return new Response("Not cached", { status: 404 });
+    if (!cached) return new Response("Not cached", { status: 404, headers: CORS_HEADERS });
+
+    const ua = (request.headers.get("User-Agent") || "").toLowerCase();
+    const isBrowser = ua.includes("mozilla") || ua.includes("chrome") || ua.includes("safari");
+    const contentType = isBrowser ? "text/plain; charset=utf-8" : "application/vnd.apple.mpegurl; charset=utf-8";
+
     return new Response(filterM3U(cached.m3u, groupName), { 
       headers: { 
-        "Content-Type": "text/plain; charset=utf-8", 
+        ...CORS_HEADERS,
+        "Content-Type": contentType, 
         "Content-Disposition": "inline",
         "Cache-Control": "no-cache" 
       } 
     });
   }
 
-  // 8. 静态资源路由（例如 public/index.html 环保主页）
+  // 8. 静态资源路由（映射至 public/index.html 静态主页）
   if (env.ASSETS) {
     return env.ASSETS.fetch(request);
   }
 
-  return new Response("Not Found", { status: 404 });
+  return new Response("Not Found", { status: 404, headers: CORS_HEADERS });
 }
