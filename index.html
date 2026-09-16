@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>湿地生态保护中心 | Wetland Conservation Center</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;600;700&display=swap');
+    body { font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif; }
+    .bg-wetland {
+      background: linear-gradient(135deg, #064e3b 0%, #047857 50%, #0f766e 100%);
+    }
+    .glass-card {
+      background: rgba(255, 255, 255, 0.08);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+    }
+  </style>
+</head>
+<body class="bg-wetland text-slate-100 min-h-screen flex flex-col justify-between selection:bg-emerald-500 selection:text-white">
+  
+  <!-- Header -->
+  <header class="w-full max-w-6xl mx-auto px-6 py-8 flex justify-between items-center">
+    <div class="flex items-center space-x-3">
+      <div class="w-10 h-10 rounded-full bg-emerald-400/20 flex items-center justify-center border border-emerald-400/40">
+        <svg class="w-6 h-6 text-emerald-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z"/>
+        </svg>
+      </div>
+      <span class="text-xl font-bold tracking-tight text-emerald-100">湿地生态监测网</span>
+    </div>
+    <div class="text-sm text-emerald-200/70 border border-emerald-500/30 px-3 py-1 rounded-full bg-emerald-900/30">
+      生态保护等级：一级防护区
+    </div>
+  </header>
+
+  <!-- Hero Content -->
+  <main class="w-full max-w-4xl mx-auto px-6 py-12 flex-grow flex flex-col justify-center items-center text-center">
+    <div class="inline-block mb-4 px-4 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-400/30 text-emerald-300 text-xs tracking-wider uppercase font-semibold">
+      Global Wetland Protection Initiative
+    </div>
+    <h1 class="text-4xl md:text-6xl font-extrabold tracking-tight mb-6 text-white leading-tight">
+      守护绿水青山，<br class="hidden sm:inline"/><span class="text-transparent bg-clip-text bg-gradient-to-r from-emerald-300 to-teal-200">共筑湿地自然生态屏障</span>
+    </h1>
+    <p class="text-emerald-100/80 text-base md:text-lg max-w-2xl mb-12 font-light leading-relaxed">
+      湿地被誉为“地球之肾”。我们致力于通过数字化与智能化监测技术，保护湿地生物多样性，维护自然生态平衡与水资源循环系统。
+    </p>
+
+    <!-- Stat Cards -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 w-full text-left">
+      <div class="glass-card p-6 rounded-2xl hover:border-emerald-400/40 transition-all duration-300">
+        <div class="text-xs text-emerald-300/80 uppercase tracking-wider font-semibold mb-1">受保护湿地面积</div>
+        <div class="text-3xl font-bold text-white mb-2">128,400 <span class="text-sm font-normal text-emerald-200">公顷</span></div>
+        <p class="text-xs text-emerald-100/60">覆盖全国核心湿地保护区及自然水域网络</p>
+      </div>
+      
+      <div class="glass-card p-6 rounded-2xl hover:border-emerald-400/40 transition-all duration-300">
+        <div class="text-xs text-emerald-300/80 uppercase tracking-wider font-semibold mb-1">监测珍稀物种</div>
+        <div class="text-3xl font-bold text-white mb-2">450+ <span class="text-sm font-normal text-emerald-200">种</span></div>
+        <p class="text-xs text-emerald-100/60">包含黑颈鹤、东方白鹳等国家一级保护动物</p>
+      </div>
+
+      <div class="glass-card p-6 rounded-2xl hover:border-emerald-400/40 transition-all duration-300">
+        <div class="text-xs text-emerald-300/80 uppercase tracking-wider font-semibold mb-1">实时水质指数 (WQI)</div>
+        <div class="text-3xl font-bold text-emerald-300 mb-2">98.2 <span class="text-sm font-normal text-emerald-200">优良</span></div>
+        <p class="text-xs text-emerald-100/60">24小时不间断物联网传感监控数据</p>
+      </div>
+    </div>
+  </main>
+
+  <!-- Footer -->
+  <footer class="w-full max-w-6xl mx-auto px-6 py-8 border-t border-emerald-800/40 text-center text-xs text-emerald-200/50">
+    <p>© 2026 湿地生态保护与研究中心. 保留所有权利。</p>
+  </footer>
+
+</body>
+</html>
