@@ -1,20 +1,16 @@
 // edge-functions/[[default]].ts
 // ========== 配置 ==========
-const CACHE_VERSION = "v8";
+const CACHE_VERSION = "v7"; // 版本号，强制刷新缓存
 const CACHE_KEY = `iptv_data_${CACHE_VERSION}`;
 const EPG_CACHE_KEY = "epg_xml_data";
 const BLACKLIST_KEY = "url_blacklist";
 const CACHE_TTL = 12 * 60 * 60 * 1000;
 const EPG_CACHE_TTL = 6 * 60 * 60 * 1000;
 const FETCH_TIMEOUT = 12000;
-const RATE_LIMIT = 30;
+const RATE_LIMIT = 20;
 
-// ★ 分组显示顺序
-const ORDERED_GROUPS = [
-  "高清", "央视", "卫视", "少儿", "音乐", "动漫", 
-  "戏曲", "纪录片", "体育", "电影", "新闻", 
-  "互联网动漫", "互联网电影", "互联网电视剧"
-];
+// ★ 高清排在最前，然后是央视、卫视
+const ORDERED_GROUPS = ["高清", "央视", "卫视", "少儿", "音乐", "动漫", "戏曲", "纪录片", "体育", "电影", "新闻", "互联网动漫", "互联网电影", "互联网电视剧"];
 
 // ========== 工具函数 ==========
 
@@ -23,14 +19,14 @@ function normalizeCCTV(name: string): string | null {
   const m = n.match(/^cctv-?(\d{1,2})/);
   if (!m) return null;
   const num = parseInt(m[1]).toString();
-  const names: Record<string, string> = {
+  const names: Record = {
     "1": "综合", "2": "财经", "3": "综艺", "4": "中文国际",
     "5": "体育", "6": "电影", "7": "国防军事", "8": "电视剧",
     "9": "纪录", "10": "科教", "11": "戏曲", "12": "社会与法",
     "13": "新闻", "14": "少儿", "15": "音乐", "16": "奥林匹克", "17": "4K 超高清"
   };
   const suffix = names[num] || "";
-  return `CCTV-${num}${suffix ? " " + suffix : ""}`;
+  return `CCTV-\({num}\){suffix ? " " + suffix : ""}`;
 }
 
 function normalizeSatellite(name: string): string | null {
@@ -39,7 +35,7 @@ function normalizeSatellite(name: string): string | null {
   return m ? `${m[1]}卫视` : null;
 }
 
-function standardizeName(name: string, aliasMap: Map<string, string>): string {
+function standardizeName(name: string, aliasMap: Map): string {
   const cctv = normalizeCCTV(name);
   if (cctv) return cctv;
   const sat = normalizeSatellite(name);
@@ -98,396 +94,133 @@ function isValidUrl(url: string): boolean {
 }
 
 function extractTags(name: string): { cleanName: string; tags: string[]; isHighDef: boolean } {
-  const tagPattern = /\[([^\]]+)\]|\((4K|1080P|720P|HEVC|H265|H264|高清|超清|蓝光|HD|SD|UHD|FHD|HDR|杜比|DOLBY)\)/gi;
-  const tags: string[] = [];
-  let match;
-  while ((match = tagPattern.exec(name)) !== null) {
-    const tag = (match[1] || match[2] || match[0]).toUpperCase();
-    tags.push(tag);
+  const tagPattern = /
+$$([^$$]+)]|$(4K|1080P|720P|HEVC|H265|H264|高清|超清|蓝光|HD|SD|UHD|FHD|HDR|杜比|DOLBY)$/gi;const tags: string[] = [];let match;while ((match = tagPattern.exec(name)) !== null) {const tag = (match[1] || match[2] || match[0]).toUpperCase();tags.push(tag);}const cleanName = name.replace(tagPattern, "").replace(/\s+/g, " ").trim();const highDefTags = ["4K", "1080P", "HEVC", "H265", "高清", "超清", "蓝光", "HD", "UHD", "FHD", "HDR"];const isHighDef = tags.some(t => highDefTags.includes(t));return { cleanName, tags, isHighDef };}function filterM3U(m3u: string, filter: string): string {const lines = m3u.split("\n");const filtered: string[] = [];let keep = false;for (const line of lines) {if (line.startsWith("#EXTM3U")) { filtered.push(line); continue; }if (line.startsWith("#EXTINF")) {keep = line.includes(group-title="${filter}");if (keep) filtered.push(line);continue;}if (keep && line.trim()) { filtered.push(line); keep = false; }}return filtered.join("\n");}// ========== 带超时的 fetch ==========async function fetchWithTimeout(url: string, timeoutMs: number): Promise {const controller = new AbortController();const timer = setTimeout(() => controller.abort(), timeoutMs);try {const r = await fetch(url, {signal: controller.signal,headers: { "User-Agent": "Mozilla/5.0" }});if (!r.ok) return "";return await r.text();} catch {return "";} finally {clearTimeout(timer);}}// ========== 拉取源 + 聚合 ==========async function fetchAndBuild(sources: string[], chanAlias: Map, kv: any): Promise<{ m3u: string; apiData: any }> {let blacklist: Set = new Set();try {const bl = await kv.get(BLACKLIST_KEY, "json");if (bl && Array.isArray(bl)) blacklist = new Set(bl);} catch {}const groups: Record>> = {};const chanMeta: Record = {};function addToGroup(group: string, stdName: string, url: string) {if (!groups[group]) groups[group] = {};if (!groups[group][stdName]) groups[group][stdName] = new Set();groups[group][stdName].add(url);}const results = await Promise.all(sources.map(url => fetchWithTimeout(url, FETCH_TIMEOUT)));for (const text of results) {if (!text) continue;const lines = text.split(/\r?\n/);let curName = "";let curTvgId = "";let curTvgLogo = "";let curTvgShift = "";for (const line of lines) {
+  const trimmed = line.trim();
+  if (trimmed.startsWith("#EXTINF")) {
+    const commaIdx = trimmed.indexOf(",");
+    curName = commaIdx >= 0 ? trimmed.substring(commaIdx + 1).trim() : "";
+    const idMatch = trimmed.match(/tvg-id="([^"]*)"/i);
+    const logoMatch = trimmed.match(/tvg-logo="([^"]*)"/i);
+    const shiftMatch = trimmed.match(/tvg-shift="([^"]*)"/i);
+    curTvgId = idMatch ? idMatch[1] : "";
+    curTvgLogo = logoMatch ? logoMatch[1] : "";
+    curTvgShift = shiftMatch ? shiftMatch[1] : "";
+    continue;
   }
-  const cleanName = name.replace(tagPattern, "").replace(/\s+/g, " ").trim();
-  const highDefTags = ["4K", "1080P", "HEVC", "H265", "高清", "超清", "蓝光", "HD", "UHD", "FHD", "HDR"];
-  const isHighDef = tags.some(t => highDefTags.includes(t));
-  return { cleanName, tags, isHighDef };
-}
+  if (trimmed && !trimmed.startsWith("#") && curName) {
+    if (blacklist.has(trimmed)) { curName = ""; continue; }
+    if (!isValidUrl(trimmed)) { curName = ""; continue; }
 
-function filterM3U(m3u: string, filter: string): string {
-  const lines = m3u.split("\n");
-  const filtered: string[] = [];
-  let keep = false;
-  for (const line of lines) {
-    if (line.startsWith("#EXTM3U")) { filtered.push(line); continue; }
-    if (line.startsWith("#EXTINF")) {
-      keep = line.includes(`group-title="${filter}"`);
-      if (keep) filtered.push(line);
+    let finalName = standardizeName(curName, chanAlias);
+    const { cleanName, isHighDef } = extractTags(finalName);
+    finalName = cleanName;
+
+    if (curTvgId || curTvgLogo || curTvgShift) {
+      if (!chanMeta[finalName]) chanMeta[finalName] = {};
+      if (curTvgId) chanMeta[finalName].tvgId = curTvgId;
+      if (curTvgLogo && isValidUrl(curTvgLogo)) chanMeta[finalName].tvgLogo = curTvgLogo;
+      if (curTvgShift) chanMeta[finalName].tvgShift = curTvgShift;
+    }
+
+    // 分组逻辑
+    let assignedGroup = "";
+    const cctvMatch = finalName.match(/^CCTV-\d+/);
+    const satMatch = finalName.match(/^[\u4e00-\u9fa5]{2,4}卫视/);
+
+    if (isHighDef && (cctvMatch || satMatch)) {
+      assignedGroup = "高清";
+    } else if (cctvMatch) {
+      assignedGroup = "央视";
+    } else if (satMatch) {
+      assignedGroup = "卫视";
+    } else {
+      const internetCat = matchInternetCategory(finalName);
+      if (internetCat && ORDERED_GROUPS.includes(internetCat)) {
+        assignedGroup = internetCat;
+      } else if (isHighDef) {
+        assignedGroup = "高清";
+      }
+    }
+
+    if (!assignedGroup || !ORDERED_GROUPS.includes(assignedGroup)) {
+      curName = "";
       continue;
     }
-    if (keep && line.trim()) { filtered.push(line); keep = false; }
-  }
-  return filtered.join("\n");
-}
 
-// ========== 带超时的 fetch ==========
-async function fetchWithTimeout(url: string, timeoutMs: number): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const r = await fetch(url, {
-      signal: controller.signal,
-      headers: { "User-Agent": "Mozilla/5.0" }
-    });
-    if (!r.ok) return "";
-    return await r.text();
-  } catch {
-    return "";
-  } finally {
-    clearTimeout(timer);
+    addToGroup(assignedGroup, finalName, trimmed);
+
+    const extras = matchExtraCategories(finalName);
+    for (const cat of extras) {
+      if (ORDERED_GROUPS.includes(cat)) {
+        addToGroup(cat, finalName, trimmed);
+      }
+    }
+
+    curName = "";
   }
 }
-
-// ========== 拉取源 + 聚合 ==========
-async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, kv: any): Promise<{ m3u: string; apiData: any }> {
-  let blacklist: Set<string> = new Set();
-  try {
-    const bl = await kv.get(BLACKLIST_KEY, "json");
-    if (bl && Array.isArray(bl)) blacklist = new Set(bl);
-  } catch {}
-
-  const groups: Record<string, Record<string, Set<string>>> = {};
-  const chanMeta: Record<string, { tvgId?: string; tvgLogo?: string; tvgShift?: string }> = {};
-
-  function addToGroup(group: string, stdName: string, url: string) {
-    if (!groups[group]) groups[group] = {};
-    if (!groups[group][stdName]) groups[group][stdName] = new Set();
-    groups[group][stdName].add(url);
+}// ===== 生成 M3U =====let m3u = "#EXTM3U\n";const urlFirstChan = new Map();for (const g of ORDERED_GROUPS) {const chanMap = groups[g];if (!chanMap) continue;for (const chan of Object.keys(chanMap)) {for (const url of chanMap[chan]) {if (!urlFirstChan.has(url)) urlFirstChan.set(url, chan);}}}const cctvOrder = (a: string, b: string) => {const na = a.match(/CCTV-(\d+)/)?.[1] || "999";const nb = b.match(/CCTV-(\d+)/)?.[1] || "999";return parseInt(na) - parseInt(nb);};for (const g of ORDERED_GROUPS) {const chanMap = groups[g];if (!chanMap) continue;let chanNames = Object.keys(chanMap);if (g === "央视") chanNames.sort(cctvOrder);else chanNames.sort((a, b) => a.localeCompare(b));for (const chan of chanNames) {
+  for (const url of chanMap[chan]) {
+    if (urlFirstChan.get(url) !== chan) continue;
+    const meta = chanMeta[chan] || {};
+    const logo = meta.tvgLogo || getLogo(chan);
+    const tvgIdAttr = meta.tvgId ? ` tvg-id="${meta.tvgId}"` : "";
+    const tvgShiftAttr = meta.tvgShift ? ` tvg-shift="${meta.tvgShift}"` : "";
+    const logoAttr = logo ? ` tvg-logo="${logo}"` : "";
+    m3u += `#EXTINF:-1 tvg-name="\({chan}"\){tvgIdAttr}\({tvgShiftAttr}\){logoAttr} group-title="\({g}",\){chan}\n${url}\n`;
   }
-
-  const results = await Promise.all(
-    sources.map(url => fetchWithTimeout(url, FETCH_TIMEOUT))
-  );
-
-  for (const text of results) {
-    if (!text) continue;
-    const lines = text.split(/\r?\n/);
-    let curName = "";
-    let curTvgId = "";
-    let curTvgLogo = "";
-    let curTvgShift = "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith("#EXTINF")) {
-        const commaIdx = trimmed.indexOf(",");
-        curName = commaIdx >= 0 ? trimmed.substring(commaIdx + 1).trim() : "";
-        const idMatch = trimmed.match(/tvg-id="([^"]*)"/i);
-        const logoMatch = trimmed.match(/tvg-logo="([^"]*)"/i);
-        const shiftMatch = trimmed.match(/tvg-shift="([^"]*)"/i);
-        curTvgId = idMatch ? idMatch[1] : "";
-        curTvgLogo = logoMatch ? logoMatch[1] : "";
-        curTvgShift = shiftMatch ? shiftMatch[1] : "";
-        continue;
-      }
-      if (trimmed && !trimmed.startsWith("#") && curName) {
-        if (blacklist.has(trimmed)) { curName = ""; continue; }
-        if (!isValidUrl(trimmed)) { curName = ""; continue; }
-
-        let finalName = standardizeName(curName, chanAlias);
-        const { cleanName, isHighDef } = extractTags(finalName);
-        finalName = cleanName;
-
-        if (curTvgId || curTvgLogo || curTvgShift) {
-          if (!chanMeta[finalName]) chanMeta[finalName] = {};
-          if (curTvgId) chanMeta[finalName].tvgId = curTvgId;
-          if (curTvgLogo && isValidUrl(curTvgLogo)) chanMeta[finalName].tvgLogo = curTvgLogo;
-          if (curTvgShift) chanMeta[finalName].tvgShift = curTvgShift;
-        }
-
-        let assignedGroup = "";
-        const cctvMatch = finalName.match(/^CCTV-\d+/);
-        const satMatch = finalName.match(/^[\u4e00-\u9fa5]{2,4}卫视/);
-
-        if (isHighDef && (cctvMatch || satMatch)) {
-          assignedGroup = "高清";
-        } else if (cctvMatch) {
-          assignedGroup = "央视";
-        } else if (satMatch) {
-          assignedGroup = "卫视";
-        } else {
-          const internetCat = matchInternetCategory(finalName);
-          if (internetCat && ORDERED_GROUPS.includes(internetCat)) {
-            assignedGroup = internetCat;
-          } else if (isHighDef) {
-            assignedGroup = "高清";
-          }
-        }
-
-        if (!assignedGroup || !ORDERED_GROUPS.includes(assignedGroup)) {
-          curName = "";
-          continue;
-        }
-
-        addToGroup(assignedGroup, finalName, trimmed);
-
-        const extras = matchExtraCategories(finalName);
-        for (const cat of extras) {
-          if (ORDERED_GROUPS.includes(cat)) {
-            addToGroup(cat, finalName, trimmed);
-          }
-        }
-
-        curName = "";
-      }
-    }
-  }
-
-  // ===== 生成 M3U =====
-  let m3u = "#EXTM3U\n";
-  const urlFirstChan = new Map<string, string>();
-  for (const g of ORDERED_GROUPS) {
-    const chanMap = groups[g];
-    if (!chanMap) continue;
-    for (const chan of Object.keys(chanMap)) {
-      for (const url of chanMap[chan]) {
-        if (!urlFirstChan.has(url)) urlFirstChan.set(url, chan);
-      }
-    }
-  }
-
-  const cctvOrder = (a: string, b: string) => {
-    const na = a.match(/CCTV-(\d+)/)?.[1] || "999";
-    const nb = b.match(/CCTV-(\d+)/)?.[1] || "999";
-    return parseInt(na) - parseInt(nb);
-  };
-
-  for (const g of ORDERED_GROUPS) {
-    const chanMap = groups[g];
-    if (!chanMap) continue;
-    let chanNames = Object.keys(chanMap);
-    if (g === "央视") chanNames.sort(cctvOrder);
-    else chanNames.sort((a, b) => a.localeCompare(b));
-
-    for (const chan of chanNames) {
-      for (const url of chanMap[chan]) {
-        if (urlFirstChan.get(url) !== chan) continue;
-        const meta = chanMeta[chan] || {};
-        const logo = meta.tvgLogo || getLogo(chan);
-        const tvgIdAttr = meta.tvgId ? ` tvg-id="${meta.tvgId}"` : "";
-        const tvgShiftAttr = meta.tvgShift ? ` tvg-shift="${meta.tvgShift}"` : "";
-        const logoAttr = logo ? ` tvg-logo="${logo}"` : "";
-        m3u += `#EXTINF:-1 tvg-name="${chan}"${tvgIdAttr}${tvgShiftAttr}${logoAttr} group-title="${g}",${chan}\n${url}\n`;
-      }
-    }
-  }
-
-  // ===== API 数据 =====
-  const categories = ORDERED_GROUPS.map((g, i) => ({
-    category_id: i + 1,
-    category_name: g,
-    parent_id: 0
-  }));
-
-  const streams: any[] = [];
-  let streamId = 1;
-  for (const g of ORDERED_GROUPS) {
-    const chanMap = groups[g];
-    if (!chanMap) continue;
-    for (const chan of Object.keys(chanMap)) {
-      for (const url of chanMap[chan]) {
-        if (urlFirstChan.get(url) !== chan) continue;
-        const meta = chanMeta[chan] || {};
-        const logo = meta.tvgLogo || getLogo(chan);
-        streams.push({
-          num: streamId, name: chan, stream_type: "live", stream_id: streamId,
-          stream_icon: logo, epg_channel_id: meta.tvgId || chan,
-          category_id: ORDERED_GROUPS.indexOf(g) + 1, custom_sid: "", tv_archive: 0, direct_source: url
-        });
-        streamId++;
-      }
-    }
-  }
-
-  return { m3u, apiData: { categories, streams } };
 }
+}// ===== API 数据 =====const categories = ORDERED_GROUPS.map((g, i) => ({category_id: i + 1,category_name: g,parent_id: 0}));const streams: any[] = [];let streamId = 1;for (const g of ORDERED_GROUPS) {const chanMap = groups[g];if (!chanMap) continue;for (const chan of Object.keys(chanMap)) {for (const url of chanMap[chan]) {if (urlFirstChan.get(url) !== chan) continue;const meta = chanMeta[chan] || {};const logo = meta.tvgLogo || getLogo(chan);streams.push({num: streamId, name: chan, stream_type: "live", stream_id: streamId,stream_icon: logo, epg_channel_id: meta.tvgId || chan,category_id: ORDERED_GROUPS.indexOf(g) + 1, custom_sid: "", tv_archive: 0, direct_source: url});streamId++;}}}return { m3u, apiData: { categories, streams } };}// ========== 入口函数 ==========export async function onRequest(context: any) {const { request, env } = context;const url = new URL(request.url);const path = url.pathname;// 关键修改：直接使用全局变量 IPTV_KV（腾讯云 EdgeOne 规范）// @ts-ignoreconst kv = (typeof IPTV_KV !== 'undefined') ? IPTV_KV : (env && env.IPTV_KV);if (!kv) return new Response("ERROR: IPTV_KV 未绑定", { status: 500 });const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown";const rateKey = rate_${ip};try {const attempts = await kv.get(rateKey);if (attempts && parseInt(attempts) > RATE_LIMIT) return new Response("Rate limited", { status: 429 });await kv.put(rateKey, String((parseInt(attempts || "0") + 1)), { expirationTtl: 60 });} catch {}// 1. 手动刷新路由if (path === "/refresh") {try {const key = url.searchParams.get("key");if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });  const sources = (env.SOURCES || "").split(",").map((s: string) => s.trim()).filter(Boolean);
+  if (sources.length === 0) return new Response("ERROR: SOURCES 未配置", { status: 500 });
 
-// ========== 入口处理 ==========
-export async function onRequest(context: any) {
-  const { request, env } = context;
-  const url = new URL(request.url);
-  const path = url.pathname;
-
-  const kv = env.IPTV_KV;
-  if (!kv) return new Response("ERROR: IPTV_KV 未绑定", { status: 500 });
-
-  // 限流策略
-  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-  const rateKey = `rate_${ip}`;
-  try {
-    const attempts = await kv.get(rateKey);
-    if (attempts && parseInt(attempts) > RATE_LIMIT) return new Response("Rate limited", { status: 429 });
-    await kv.put(rateKey, String((parseInt(attempts || "0") + 1)), { expirationTtl: 60 });
-  } catch {}
-
-  // 1. 刷新数据接口
-  if (path === "/refresh") {
-    try {
-      const key = url.searchParams.get("key");
-      if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
-
-      const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
-      if (sources.length === 0) return new Response("ERROR: SOURCES 未配置", { status: 500 });
-
-      const chanAlias = new Map<string, string>();
-      const aliasStr = env.CHAN_ALIAS || "";
-      if (aliasStr) {
-        aliasStr.split(",").forEach((pair: string) => {
-          const [from, to] = pair.split("=").map(s => s.trim());
-          if (from && to) chanAlias.set(from, to);
-        });
-      }
-
-      const result = await fetchAndBuild(sources, chanAlias, kv);
-      await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() }));
-      return new Response("Refreshed OK", { status: 200 });
-    } catch (err: any) {
-      return new Response(`Refresh Error: ${err.message || err}`, { status: 500 });
-    }
-  }
-
-  // 2. 状态查询接口
-  if (path === "/status") {
-    try {
-      let cached: any = null;
-      try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
-      const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
-      const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
-      return new Response(JSON.stringify({
-        version: CACHE_VERSION, cached: !!cached,
-        updated_at: cached ? new Date(cached.updated_at).toISOString() : null,
-        age_minutes: cached ? Math.floor((Date.now() - cached.updated_at) / 60000) : null,
-        sources_count: sources.length, epg_sources: epgList, epg_proxy: "/epg.xml",
-        groups: ORDERED_GROUPS,
-      }, null, 2), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-    } catch (err: any) {
-      return new Response(`Status Error: ${err.message}`, { status: 500 });
-    }
-  }
-
-  // 3. M3U 纯文本订阅导出（避免激活浏览器内建播放插件）
-  if (path === "/iptv.m3u") {
-    const key = url.searchParams.get("key");
-    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
-    const sources = (env.SOURCES || "").split(",").map(s => s.trim()).filter(Boolean);
-    if (sources.length === 0) return new Response("SOURCES not configured", { status: 500 });
-
-    const chanAlias = new Map<string, string>();
-    const aliasStr = env.CHAN_ALIAS || "";
-    if (aliasStr) {
-      aliasStr.split(",").forEach((pair: string) => {
-        const [from, to] = pair.split("=").map(s => s.trim());
-        if (from && to) chanAlias.set(from, to);
-      });
-    }
-
-    let cached: any = null;
-    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
-    const now = Date.now();
-    const isFresh = cached && (now - (cached.updated_at || 0)) < CACHE_TTL;
-
-    const plainHeaders = {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Content-Disposition": "inline",
-      "Cache-Control": "no-cache"
-    };
-
-    if (isFresh) return new Response(cached.m3u, { headers: plainHeaders });
-
-    if (cached) {
-      const response = new Response(cached.m3u, { headers: plainHeaders });
-      fetchAndBuild(sources, chanAlias, kv).then(result => {
-        kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() })).catch(() => {});
-      }).catch(() => {});
-      return response;
-    }
-
-    const result = await fetchAndBuild(sources, chanAlias, kv);
-    try { await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: now })); } catch {}
-    return new Response(result.m3u, { headers: plainHeaders });
-  }
-
-  // 4. EPG 代理
-  if (path === "/epg.xml") {
-    try {
-      const cached = await kv.get(EPG_CACHE_KEY, "text");
-      if (cached) return new Response(cached, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
-    } catch {}
-    const epgList = (env.EPG_URL || "").split(",").map(s => s.trim()).filter(Boolean);
-    const epgUrl = epgList[0];
-    if (!epgUrl) return new Response("<!-- No EPG -->", { headers: { "Content-Type": "application/xml" } });
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 25000);
-      const r = await fetch(epgUrl, { signal: controller.signal, headers: { "User-Agent": "Mozilla/5.0" } });
-      clearTimeout(timeoutId);
-      if (r.ok) {
-        const xmlText = await r.text();
-        try { await kv.put(EPG_CACHE_KEY, xmlText, { expirationTtl: EPG_CACHE_TTL / 1000 }); } catch {}
-        return new Response(xmlText, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });
-      }
-    } catch {}
-    return new Response("<!-- EPG fetch failed -->", { headers: { "Content-Type": "application/xml" } });
-  }
-
-  // 5. 黑名单上报
-  if (path === "/report") {
-    const key = url.searchParams.get("key");
-    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
-    const badUrl = url.searchParams.get("url");
-    if (!badUrl || !isValidUrl(badUrl)) return new Response("Invalid URL", { status: 400 });
-    try {
-      let bl: string[] = await kv.get(BLACKLIST_KEY, "json") || [];
-      if (!bl.includes(badUrl)) { bl.push(badUrl); await kv.put(BLACKLIST_KEY, JSON.stringify(bl), { expirationTtl: 30 * 24 * 60 * 60 }); }
-    } catch {}
-    return new Response("Reported", { status: 200 });
-  }
-
-  // 6. Player API
-  if (path === "/player_api.php") {
-    const action = url.searchParams.get("action");
-    let cached: any = null;
-    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
-    if (!cached) return new Response(JSON.stringify({}), { headers: { "Content-Type": "application/json" } });
-    if (action === "get_live_categories") return new Response(JSON.stringify(cached.apiData?.categories || []), { headers: { "Content-Type": "application/json" } });
-    if (action === "get_live_streams") {
-      const catId = parseInt(url.searchParams.get("category_id") || "0");
-      const streams = cached.apiData?.streams || [];
-      if (catId > 0) return new Response(JSON.stringify(streams.filter((s: any) => s.category_id === catId)), { headers: { "Content-Type": "application/json" } });
-      return new Response(JSON.stringify(streams), { headers: { "Content-Type": "application/json" } });
-    }
-    return new Response(JSON.stringify({ user_info: { auth: 1, status: "Active" } }), { headers: { "Content-Type": "application/json" } });
-  }
-
-  // 7. 分组导出
-  const groupMatch = path.match(/^\/group\/(.+)\.m3u$/);
-  if (groupMatch) {
-    const key = url.searchParams.get("key");
-    if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });
-    const groupName = decodeURIComponent(groupMatch[1]);
-    let cached: any = null;
-    try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
-    if (!cached) return new Response("Not cached", { status: 404 });
-    return new Response(filterM3U(cached.m3u, groupName), { 
-      headers: { 
-        "Content-Type": "text/plain; charset=utf-8", 
-        "Content-Disposition": "inline",
-        "Cache-Control": "no-cache" 
-      } 
+  const chanAlias = new Map();
+  const aliasStr = env.CHAN_ALIAS || "";
+  if (aliasStr) {
+    aliasStr.split(",").forEach((pair: string) => {
+      const [from, to] = pair.split("=").map(s => s.trim());
+      if (from && to) chanAlias.set(from, to);
     });
   }
 
-  // 8. 根路径及静态文件通过 Pages / Edge 托管拉取（若无匹配则交由 Edge 默认静态资源通道）
-  if (env.ASSETS) {
-    return env.ASSETS.fetch(request);
-  }
-
-  return new Response("Not Found", { status: 404 });
+  const result = await fetchAndBuild(sources, chanAlias, kv);
+  await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() }));
+  return new Response("Refreshed OK", { status: 200 });
+} catch (err: any) {
+  return new Response(`Refresh Error: ${err.message || err}`, { status: 500 });
 }
+}// 2. 状态查看接口if (path === "/status") {try {let cached: any = null;try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}const sources = (env.SOURCES || "").split(",").map((s: string) => s.trim()).filter(Boolean);const epgList = (env.EPG_URL || "").split(",").map((s: string) => s.trim()).filter(Boolean);return new Response(JSON.stringify({version: CACHE_VERSION, cached: !!cached,updated_at: cached ? new Date(cached.updated_at).toISOString() : null,age_minutes: cached ? Math.floor((Date.now() - cached.updated_at) / 60000) : null,sources_count: sources.length, epg_sources: epgList, epg_proxy: "/epg.xml",groups: ORDERED_GROUPS,}, null, 2), { headers: { "Content-Type": "application/json; charset=utf-8" } });} catch (err: any) {return new Response(Status Error: ${err.message}, { status: 500 });}}// 3. M3U 文件导出接口 (强制以纯文本格式输出)if (path === "/iptv.m3u") {const key = url.searchParams.get("key");if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });const sources = (env.SOURCES || "").split(",").map((s: string) => s.trim()).filter(Boolean);if (sources.length === 0) return new Response("SOURCES not configured", { status: 500 });const chanAlias = new Map();
+const aliasStr = env.CHAN_ALIAS || "";
+if (aliasStr) {
+  aliasStr.split(",").forEach((pair: string) => {
+    const [from, to] = pair.split("=").map(s => s.trim());
+    if (from && to) chanAlias.set(from, to);
+  });
+}
+
+let cached: any = null;
+try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}
+const now = Date.now();
+const isFresh = cached && (now - (cached.updated_at || 0)) < CACHE_TTL;
+
+// 统一文本响应头：防止浏览器解析为音频/视频播放器
+const textHeaders = {
+  "Content-Type": "text/plain; charset=utf-8",
+  "Content-Disposition": "inline",
+  "Cache-Control": "no-cache"
+};
+
+if (isFresh) return new Response(cached.m3u, { headers: textHeaders });
+
+if (cached) {
+  const response = new Response(cached.m3u, { headers: textHeaders });
+  fetchAndBuild(sources, chanAlias, kv).then(result => {
+    kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() })).catch(() => {});
+  }).catch(() => {});
+  return response;
+}
+
+const result = await fetchAndBuild(sources, chanAlias, kv);
+try { await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: now })); } catch {}
+return new Response(result.m3u, { headers: textHeaders });
+}// 4. EPG 接口if (path === "/epg.xml") {try {const cached = await kv.get(EPG_CACHE_KEY, "text");if (cached) return new Response(cached, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });} catch {}const epgList = (env.EPG_URL || "").split(",").map((s: string) => s.trim()).filter(Boolean);const epgUrl = epgList[0];if (!epgUrl) return new Response("", { headers: { "Content-Type": "application/xml" } });try {const controller = new AbortController();const timeoutId = setTimeout(() => controller.abort(), 25000);const r = await fetch(epgUrl, { signal: controller.signal, headers: { "User-Agent": "Mozilla/5.0" } });clearTimeout(timeoutId);if (r.ok) {const xmlText = await r.text();try { await kv.put(EPG_CACHE_KEY, xmlText, { expirationTtl: EPG_CACHE_TTL / 1000 }); } catch {}return new Response(xmlText, { headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "max-age=21600" } });}} catch {}return new Response("", { headers: { "Content-Type": "application/xml" } });}// 5. 反馈报障接口if (path === "/report") {const key = url.searchParams.get("key");if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });const badUrl = url.searchParams.get("url");if (!badUrl || !isValidUrl(badUrl)) return new Response("Invalid URL", { status: 400 });try {let bl: string[] = await kv.get(BLACKLIST_KEY, "json") || [];if (!bl.includes(badUrl)) { bl.push(badUrl); await kv.put(BLACKLIST_KEY, JSON.stringify(bl), { expirationTtl: 30 * 24 * 60 * 60 }); }} catch {}return new Response("Reported", { status: 200 });}// 6. API 播放器接口if (path === "/player_api.php") {const action = url.searchParams.get("action");let cached: any = null;try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}if (!cached) return new Response(JSON.stringify({}), { headers: { "Content-Type": "application/json" } });if (action === "get_live_categories") return new Response(JSON.stringify(cached.apiData?.categories || []), { headers: { "Content-Type": "application/json" } });if (action === "get_live_streams") {const catId = parseInt(url.searchParams.get("category_id") || "0");const streams = cached.apiData?.streams || [];if (catId > 0) return new Response(JSON.stringify(streams.filter((s: any) => s.category_id === catId)), { headers: { "Content-Type": "application/json" } });return new Response(JSON.stringify(streams), { headers: { "Content-Type": "application/json" } });}return new Response(JSON.stringify({ user_info: { auth: 1, status: "Active" } }), { headers: { "Content-Type": "application/json" } });}// 7. 按组导出 M3Uconst groupMatch = path.match(/^/group/(.+).m3u$/);if (groupMatch) {const key = url.searchParams.get("key");if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403 });const groupName = decodeURIComponent(groupMatch[1]);let cached: any = null;try { const raw = await kv.get(CACHE_KEY, "json"); if (raw) cached = raw; } catch {}if (!cached) return new Response("Not cached", { status: 404 });return new Response(filterM3U(cached.m3u, groupName), {headers: {"Content-Type": "text/plain; charset=utf-8","Content-Disposition": "inline","Cache-Control": "no-cache"}});}return new Response("Not Found", { status: 404 });}
