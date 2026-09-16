@@ -156,7 +156,7 @@ async function fetchWithTimeout(url: string, timeoutMs: number): Promise<string>
 }
 
 // ========== 拉取源 + 聚合 ==========
-// ★ 修改：增加 epgUrl 参数，用于生成标准 M3U 头
+// ★ 保留：epgUrl 参数，生成标准 M3U 头（含 x-tvg-url）
 async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, kv: any, epgUrl?: string): Promise<{ m3u: string; apiData: any }> {
   let blacklist: Set<string> = new Set();
   try {
@@ -252,8 +252,7 @@ async function fetchAndBuild(sources: string[], chanAlias: Map<string, string>, 
     }
   }
 
-  // ===== 生成标准 M3U =====
-  // ★ 修改：加入 x-tvg-url 属性（如果提供了 EPG 地址），符合现代 IPTV 标准
+  // ===== 生成标准 M3U（含 x-tvg-url）=====
   let m3u = epgUrl ? `#EXTM3U x-tvg-url="${epgUrl}"\n` : "#EXTM3U\n";
   const urlFirstChan = new Map<string, string>();
   for (const g of ORDERED_GROUPS) {
@@ -373,7 +372,6 @@ export async function onRequest(context: any) {
         });
       }
 
-      // ★ 修改：传入 EPG URL
       const epgList = (env.EPG_URL || "").split(",").map((s: string) => s.trim()).filter(Boolean);
       const result = await fetchAndBuild(sources, chanAlias, kv, epgList[0]);
       await kv.put(CACHE_KEY, JSON.stringify({ ...result, updated_at: Date.now() }));
@@ -411,7 +409,7 @@ export async function onRequest(context: any) {
     }
   }
 
-  // 3. M3U 订阅导出（★ 修改：统一为标准 M3U 文件，不再区分浏览器 UA）
+  // 3. M3U 订阅导出（★ 方案A：UA 判断，浏览器看文本，播放器拿标准 M3U）
   if (path === "/iptv.m3u") {
     const key = url.searchParams.get("key");
     if (key !== env.AUTH_KEY) return new Response("Unauthorized", { status: 403, headers: CORS_HEADERS });
@@ -436,10 +434,16 @@ export async function onRequest(context: any) {
     const now = Date.now();
     const isFresh = cached && (now - (cached.updated_at || 0)) < CACHE_TTL;
 
-    // ★ 修改：强制使用标准 M3U MIME 类型，并以内联方式提供（播放器可直接订阅）
+    // ★ UA 判断：浏览器显示纯文本，IPTV 播放器使用标准 M3U Header
+    const ua = (request.headers.get("User-Agent") || "").toLowerCase();
+    const isBrowser = ua.includes("mozilla") || ua.includes("chrome") || ua.includes("safari");
+    const contentType = isBrowser
+      ? "text/plain; charset=utf-8"
+      : "application/vnd.apple.mpegurl; charset=utf-8";
+
     const m3uHeaders = {
       ...CORS_HEADERS,
-      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+      "Content-Type": contentType,
       "Content-Disposition": "inline; filename=\"iptv.m3u\"",
       "Cache-Control": "no-cache"
     };
@@ -523,7 +527,7 @@ export async function onRequest(context: any) {
     return new Response(JSON.stringify({ user_info: { auth: 1, status: "Active" } }), { headers: jsonHeaders });
   }
 
-  // 7. 分组导出（★ 修改：同样使用标准 M3U MIME 类型）
+  // 7. 分组导出（★ 方案A：同样恢复 UA 判断）
   const groupMatch = path.match(/^\/group\/(.+)\.m3u$/);
   if (groupMatch) {
     const key = url.searchParams.get("key");
@@ -536,11 +540,16 @@ export async function onRequest(context: any) {
     } catch {}
     if (!cached) return new Response("Not cached", { status: 404, headers: CORS_HEADERS });
 
-    // ★ 修改：不再判断 UA，直接返回标准 M3U 类型
+    const ua = (request.headers.get("User-Agent") || "").toLowerCase();
+    const isBrowser = ua.includes("mozilla") || ua.includes("chrome") || ua.includes("safari");
+    const contentType = isBrowser
+      ? "text/plain; charset=utf-8"
+      : "application/vnd.apple.mpegurl; charset=utf-8";
+
     return new Response(filterM3U(cached.m3u, groupName), { 
       headers: { 
         ...CORS_HEADERS,
-        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8", 
+        "Content-Type": contentType, 
         "Content-Disposition": "inline; filename=\"playlist.m3u\"",
         "Cache-Control": "no-cache" 
       } 
